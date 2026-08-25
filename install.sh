@@ -238,6 +238,19 @@ if ! confirm "Запускаю автоматическую настройку?"
     exit 0
 fi
 
+#===============================================================================
+# Обновление системы (перед всем остальным)
+#===============================================================================
+step "Обновление системы (apt update + upgrade)..."
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+apt-get update -y >/dev/null 2>&1 || warn "apt update завершился с ошибкой — продолжаю."
+if apt-get -y -o Dpkg::Options::=--force-confold upgrade >/dev/null 2>&1; then
+    success "Система обновлена."
+else
+    warn "apt upgrade завершился с ошибкой — продолжаю."
+fi
+
 # effective_ssh_port — порт, на котором SSH РЕАЛЬНО слушает после шага 2
 EFFECTIVE_SSH_PORT="$CURRENT_SSH_PORT"
 
