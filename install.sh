@@ -851,6 +851,11 @@ NODE_PORT_FILE="/etc/$(tok np).port"
 SYN_MARK="$(tok syn)"
 SYN_SYSCTL="/etc/sysctl.d/99-$(tok synp).conf"
 
+# Кастомный Xray-core: бинарник на хосте монтируется поверх зашитого в образ.
+XRAY_BIN="/opt/remnanode/xray"
+XRAY_MARK="$(tok xray)"
+NODE_COMPOSE="/opt/remnanode/docker-compose.yml"
+
 need_root() { [[ $EUID -eq 0 ]] || { echo -e "${R}Запустите от root (sudo nodectl).${N}"; exit 1; }; }
 pause() { echo ""; read -rp "$(echo -e "${GR}Enter — назад...${N}")" _ || true; }
 
@@ -1367,6 +1372,156 @@ menu_selfsteal() {
     esac
 }
 
+# ---------- Кастомный Xray-core ----------
+_xray_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "64" ;;
+        aarch64|arm64|armv8*) echo "arm64-v8a" ;;
+        armv7*|armv7l) echo "arm32-v7a" ;;
+        *) echo "" ;;
+    esac
+}
+_xray_cver() { docker exec remnanode xray version 2>/dev/null | head -1 | awk '{print $2}'; }
+_xray_custom_on() { grep -q "${XRAY_MARK}-xraybegin" "$NODE_COMPOSE" 2>/dev/null; }
+
+_xray_add_mount() {
+    python3 - "$NODE_COMPOSE" "$XRAY_MARK" "$XRAY_BIN" <<'PY'
+import sys, re
+f, mark, binpath = sys.argv[1], sys.argv[2], sys.argv[3]
+b="    # %s-xraybegin"%mark; e="    # %s-xrayend"%mark
+c=open(f).read()
+c=re.sub(r'\n'+re.escape(b)+r'.*?'+re.escape(e)+r'\n','\n',c,flags=re.DOTALL)
+block="%s\n    volumes:\n      - %s:/usr/local/bin/xray\n%s\n"%(b, binpath, e)
+m=re.search(r'^    environment:', c, re.M)
+c = c[:m.start()]+block+c[m.start():] if m else c.rstrip()+"\n"+block
+open(f,'w').write(c); print("OK")
+PY
+}
+_xray_del_mount() {
+    python3 - "$NODE_COMPOSE" "$XRAY_MARK" <<'PY'
+import sys, re
+f, mark = sys.argv[1], sys.argv[2]
+b="    # %s-xraybegin"%mark; e="    # %s-xrayend"%mark
+c=open(f).read()
+c=re.sub(r'\n'+re.escape(b)+r'.*?'+re.escape(e)+r'\n','\n',c,flags=re.DOTALL)
+open(f,'w').write(c); print("OK")
+PY
+}
+
+xray_status() {
+    [[ -f "$NODE_COMPOSE" ]] || { echo -e "${R}Нода не установлена.${N}"; return 1; }
+    echo -e "  Версия Xray в контейнере: ${C}$(_xray_cver)${N}"
+    if _xray_custom_on; then
+        echo -e "  Режим: ${Y}кастомная версия${N} (${XRAY_BIN})"
+    else
+        echo -e "  Режим: ${G}по умолчанию (из образа remnawave/node)${N}"
+    fi
+}
+
+# Печатает список тегов Xray-core: аргумент stable|all
+_xray_list() {
+    local mode="$1" raw
+    raw=$(curl -fsSL "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=30" 2>/dev/null) || return 1
+    [[ -n "$raw" ]] || return 1
+    if [[ "$mode" == "stable" ]]; then
+        printf '%s' "$raw" | python3 -c 'import sys,json; [print(r["tag_name"]) for r in json.load(sys.stdin) if not r.get("prerelease")]' 2>/dev/null | head -8
+    else
+        printf '%s' "$raw" | python3 -c 'import sys,json; [print(r["tag_name"]) for r in json.load(sys.stdin)]' 2>/dev/null | head -10
+    fi
+}
+
+# Скачивает и монтирует конкретную версию Xray-core. Аргумент: тег (напр. v26.3.27)
+xray_install_version() {
+    local ver="$1"
+    [[ -f "$NODE_COMPOSE" ]] || { echo -e "${R}Нода не установлена.${N}"; return 1; }
+    command -v python3 >/dev/null 2>&1 || { echo -e "${R}Нужен python3.${N}"; return 1; }
+    local arch; arch=$(_xray_arch)
+    [[ -n "$arch" ]] || { echo -e "${R}Архитектура $(uname -m) не поддерживается.${N}"; return 1; }
+    command -v unzip >/dev/null 2>&1 || apt-get install -y -qq unzip >/dev/null 2>&1 || true
+    local url="https://github.com/XTLS/Xray-core/releases/download/${ver}/Xray-linux-${arch}.zip"
+    echo -e "${C}Скачиваю Xray-core ${ver} (${arch})...${N}"
+    local tmp; tmp=$(mktemp -d)
+    if ! curl -fsSL "$url" -o "$tmp/x.zip"; then rm -rf "$tmp"; echo -e "${R}Не скачалось: $url${N}"; return 1; fi
+    mkdir -p /opt/remnanode
+    if ! unzip -o "$tmp/x.zip" xray -d /opt/remnanode >/dev/null 2>&1; then rm -rf "$tmp"; echo -e "${R}В архиве нет бинарника xray.${N}"; return 1; fi
+    rm -rf "$tmp"; chmod +x "$XRAY_BIN"
+    _xray_add_mount
+    echo -e "${C}Пересоздаю контейнер...${N}"
+    ( cd /opt/remnanode && docker compose up -d --force-recreate ) >/dev/null 2>&1 || true
+    sleep 4
+    echo -e "${G}Готово. Версия Xray в контейнере: $(_xray_cver).${N}"
+}
+
+xray_revert() {
+    [[ -f "$NODE_COMPOSE" ]] || { echo -e "${R}Нода не установлена.${N}"; return 1; }
+    if ! _xray_custom_on; then echo -e "${Y}Уже используется дефолтная версия.${N}"; return; fi
+    _xray_del_mount
+    rm -f "$XRAY_BIN"
+    echo -e "${C}Пересоздаю контейнер...${N}"
+    ( cd /opt/remnanode && docker compose up -d --force-recreate ) >/dev/null 2>&1 || true
+    sleep 4
+    echo -e "${G}Возврат к дефолту. Версия Xray: $(_xray_cver).${N}"
+    echo -e "${GR}Теперь после 'nodectl update' будет ядро из нового образа ноды.${N}"
+}
+
+menu_xray() {
+    [[ -f "$NODE_COMPOSE" ]] || { echo -e "${R}Нода не установлена.${N}"; pause; return 1; }
+    command -v python3 >/dev/null 2>&1 || { echo -e "${R}Нужен python3.${N}"; pause; return 1; }
+    local mode="stable" versions=() a i v mv arch cver cmode
+    mapfile -t versions < <(_xray_list "$mode")
+    while true; do
+        clear
+        arch=$(_xray_arch); [[ -n "$arch" ]] || arch="?"
+        cver=$(_xray_cver); [[ -n "$cver" ]] || cver="—"
+        if _xray_custom_on; then cmode="${Y}🟢 кастомная (примонтирована)${N}"; else cmode="${G}⚪ встроенная (из образа)${N}"; fi
+        echo -e "${C}══════════════ Xray-core ══════════════${N}"
+        echo ""
+        echo -e "  ${C}🌐 Текущее состояние${N}"
+        echo -e "     Версия Xray:   ${cver}"
+        echo -e "     Архитектура:   ${arch}"
+        echo -e "     Режим ядра:    ${cmode}"
+        echo ""
+        if [[ "$mode" == "stable" ]]; then
+            echo -e "  ${C}🎯 Показ релизов:${N} ${G}только стабильные${N}"
+        else
+            echo -e "  ${C}🎯 Показ релизов:${N} ${Y}все (включая pre-release)${N}"
+        fi
+        echo ""
+        echo -e "  ${C}🚀 Доступные версии:${N}"
+        if [[ ${#versions[@]} -eq 0 ]]; then
+            echo -e "     ${R}список не получен (сеть?) — можно ввести вручную (m)${N}"
+        else
+            i=1
+            for v in "${versions[@]}"; do echo "     $i) $v"; i=$((i+1)); done
+        fi
+        echo ""
+        echo -e "  ${C}🔧 Действия:${N}"
+        echo "     m) ввести версию вручную"
+        if [[ "$mode" == "stable" ]]; then
+            echo "     a) показать все (с pre-release)"
+        else
+            echo "     s) только стабильные"
+        fi
+        echo "     r) обновить список"
+        echo "     d) вернуть встроенную версию (из образа)"
+        echo "     0) назад"
+        echo -e "${C}═══════════════════════════════════════${N}"
+        read -rp "> " a || return
+        case "${a:-}" in
+            0|q|Q|"") return ;;
+            m|M) read -rp "Версия (напр. v26.3.27): " mv || continue
+                 [[ -n "${mv:-}" ]] && { xray_install_version "$mv"; pause; } ;;
+            a|A) mode="all";    mapfile -t versions < <(_xray_list "$mode") ;;
+            s|S) mode="stable"; mapfile -t versions < <(_xray_list "$mode") ;;
+            r|R) mapfile -t versions < <(_xray_list "$mode") ;;
+            d|D) xray_revert; pause ;;
+            *) if [[ "$a" =~ ^[0-9]+$ ]] && (( a >= 1 && a <= ${#versions[@]} )); then
+                   xray_install_version "${versions[$((a-1))]}"; pause
+               fi ;;
+        esac
+    done
+}
+
 node_restart() {
     [[ -f /opt/remnanode/docker-compose.yml ]] || { echo -e "${R}Нода не установлена (/opt/remnanode).${N}"; return 1; }
     echo -e "${C}Перезапускаю ноду...${N}"
@@ -1442,7 +1597,10 @@ main_menu() {
         echo -e "  7) ${psi_c}🌀 Psiphon (обход RU-метки, для Gemini)${N}"
         echo -e "  8) ${ss_c}🎭 Selfsteal (маскировка Reality)${N}"
         echo ""
+        echo -e "${GR}──── 🖥️  Нода ────${N}"
+        echo "  9) 🧬 Xray-core (своя версия / дефолт)"
         echo "  u) 🗑️  Удалить ноду (полностью)"
+        echo -e "${GR}     перезапуск/обновление: nodectl restart | nodectl update${N}"
         echo ""
         echo "  0) Выход"
         read -rp "> " ch || exit 0
@@ -1455,6 +1613,7 @@ main_menu() {
             6) show_logs; pause ;;
             7) menu_psiphon; pause ;;
             8) menu_selfsteal; pause ;;
+            9) menu_xray ;;
             u|U) node_uninstall; pause ;;
             0|q) exit 0 ;;
             *) : ;;
