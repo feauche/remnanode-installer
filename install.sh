@@ -844,7 +844,7 @@ tok() { printf '%s' "${_SEED}:$1" | sha256sum | cut -c1-12; }
 IPV6_CONF="/etc/sysctl.d/98-$(tok ipv6).conf"
 BEFORE_RULES="/etc/ufw/before.rules"
 
-# Geoblock (только SSH; RU/IR НЕ включаем — это целевая аудитория VPN).
+# Geoblock (весь сервер, все порты; RU/IR НЕ включаем — это целевая аудитория VPN).
 GEO_SET="geoblock4"
 GEO_SAVE="/etc/$(tok geo).ipset"
 GEO_COUNTRIES="/etc/$(tok geo).countries"
@@ -1597,17 +1597,19 @@ menu_xray() {
         echo "     d) вернуть встроенную версию (из образа)"
         echo "     0) назад"
         echo -e "${C}═══════════════════════════════════════${N}"
-        read -rp "> " a || return
+        read -rp "$PROMPT" a || return
         case "${a:-}" in
             0|q|Q|"") return ;;
-            m|M) read -rp "Версия (напр. v26.3.27): " mv || continue
-                 [[ -n "${mv:-}" ]] && { xray_install_version "$mv"; pause; } ;;
+            m|M) echo ""; read -rp "  Версия (напр. v26.3.27): " mv || continue
+                 if [[ -n "${mv:-}" ]]; then xray_install_version "$mv"; pause; else echo -e "${Y}Ничего не введено.${N}"; sleep 1; fi ;;
             a|A) mode="all";    mapfile -t versions < <(_xray_list "$mode") ;;
             s|S) mode="stable"; mapfile -t versions < <(_xray_list "$mode") ;;
             r|R) mapfile -t versions < <(_xray_list "$mode") ;;
             d|D) xray_revert; pause ;;
             *) if [[ "$a" =~ ^[0-9]+$ ]] && (( a >= 1 && a <= ${#versions[@]} )); then
                    xray_install_version "${versions[$((a-1))]}"; pause
+               else
+                   echo -e "${Y}Неверный выбор.${N}"; sleep 1
                fi ;;
         esac
     done
