@@ -186,9 +186,16 @@ if [[ $NODE_EXISTS -eq 0 ]]; then
     SECRET_KEY="${SECRET_KEY%\"}"; SECRET_KEY="${SECRET_KEY#\"}"
 fi
 
-NODE_PORT=$(ask "Порт ноды" "$DEFAULT_NODE_PORT")
-if ! validate_port "$NODE_PORT"; then
-    error "Некорректный порт ноды: '$NODE_PORT' (нужно 1–65535)."
+if [[ $NODE_EXISTS -eq 1 ]]; then
+    # Нода уже стоит — порт не спрашиваем, берём из её docker-compose.yml (нужен для UFW).
+    NODE_PORT=$(grep -oE 'NODE_PORT=[0-9]+' /opt/remnanode/docker-compose.yml 2>/dev/null | head -1 | cut -d= -f2)
+    [[ -n "${NODE_PORT:-}" ]] || NODE_PORT="$DEFAULT_NODE_PORT"
+    info "Порт ноды взят из установленной ноды: ${CYAN}${NODE_PORT}${RESET}"
+else
+    NODE_PORT=$(ask "Порт ноды" "$DEFAULT_NODE_PORT")
+    if ! validate_port "$NODE_PORT"; then
+        error "Некорректный порт ноды: '$NODE_PORT' (нужно 1–65535)."
+    fi
 fi
 
 # Версия образа ноды. У remnawave/node нет «скользящего» тега 2 — фиксируем
@@ -859,8 +866,14 @@ NODE_COMPOSE="/opt/remnanode/docker-compose.yml"
 need_root() { [[ $EUID -eq 0 ]] || { echo -e "${R}Запустите от root (sudo nodectl).${N}"; exit 1; }; }
 pause() { echo ""; read -rp "$(echo -e "${GR}Enter — назад...${N}")" _ || true; }
 
+# Единый промпт выбора пункта (с пустой строкой-отступом сверху) и чистый заголовок экрана.
+PROMPT="$(echo -ne "\n${C}Выберите пункт меню:${N} ")"
+hdr() { clear; echo ""; echo -e "  ${C}$1${N}"; echo -e "  ${GR}────────────────────────────────${N}"; echo ""; }
+
 show_status() {
-    echo -e "${C}================= СТАТУС =================${N}"
+    echo ""
+    echo -e "  ${C}Статус сервера${N}"
+    echo -e "  ${GR}────────────────────────────────${N}"
     local s st
     for s in ufw fail2ban; do
         if systemctl is-active --quiet "$s" 2>/dev/null; then st="${G}активен${N}"; else st="${R}не активен${N}"; fi
@@ -887,24 +900,55 @@ show_status() {
     else
         printf "  %-24s %b\n" "ICMP ping" "${G}разрешён${N}"
     fi
-    echo -e "${C}=========================================${N}"
+    if ipset list "$GEO_SET" -terse &>/dev/null; then
+        printf "  %-24s %b\n" "геоблок SSH" "${G}включён${N}"
+    else
+        printf "  %-24s %b\n" "геоблок SSH" "${GR}выключен${N}"
+    fi
+    if _syn_enabled; then
+        printf "  %-24s %b\n" "SYNPROXY" "${G}включён${N}"
+    else
+        printf "  %-24s %b\n" "SYNPROXY" "${GR}выключен${N}"
+    fi
+    if [[ -f "$NODE_COMPOSE" ]]; then
+        if _xray_custom_on; then
+            printf "  %-24s %b\n" "Xray-core" "${Y}кастомный${N}"
+        else
+            printf "  %-24s %b\n" "Xray-core" "${G}дефолт${N}"
+        fi
+    fi
+    echo ""
 }
 
 menu_fail2ban() {
-    command -v fail2ban-client >/dev/null 2>&1 || { echo -e "${R}fail2ban не установлен.${N}"; return; }
-    echo -e "${C}Fail2Ban — sshd:${N}"
-    fail2ban-client status sshd 2>/dev/null || echo "джейл sshd не найден"
-    echo ""
-    echo "  1) Разбанить IP    0) Назад"
-    read -rp "> " a || return
-    case "${a:-}" in
-        1) read -rp "IP для разбана: " ip || return
-           [[ -n "${ip:-}" ]] && fail2ban-client set sshd unbanip "$ip" && echo -e "${G}${ip} разбанен.${N}" ;;
-        *) : ;;
-    esac
+    command -v fail2ban-client >/dev/null 2>&1 || { clear; echo ""; echo -e "${R}fail2ban не установлен.${N}"; pause; return; }
+    local a ip
+    while true; do
+        hdr "Fail2Ban — баны SSH"
+        fail2ban-client status sshd 2>/dev/null || echo "  джейл sshd не найден"
+        echo ""
+        echo "  1) Разбанить IP"
+        echo ""
+        echo "  0) Назад"
+        read -rp "$PROMPT" a || return
+        case "${a:-}" in
+            1) echo ""; read -rp "  IP для разбана: " ip || continue
+               if [[ -z "${ip:-}" ]]; then
+                   echo -e "${Y}IP не введён.${N}"
+               elif fail2ban-client set sshd unbanip "$ip" >/dev/null 2>&1; then
+                   echo -e "${G}${ip} разбанен.${N}"
+               else
+                   echo -e "${R}Не удалось разбанить ${ip} (не забанен или неверный формат).${N}"
+               fi
+               pause ;;
+            0|q|"") return ;;
+            *) echo -e "${Y}Неверный выбор.${N}"; sleep 1 ;;
+        esac
+    done
 }
 
 toggle_ipv6() {
+    clear; echo ""
     if sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q 1; then
         printf 'net.ipv6.conf.all.disable_ipv6 = 0\nnet.ipv6.conf.default.disable_ipv6 = 0\n' > "$IPV6_CONF"
         sysctl -p "$IPV6_CONF" >/dev/null 2>&1
@@ -913,6 +957,14 @@ toggle_ipv6() {
         ufw reload >/dev/null 2>&1 || true
         echo -e "${G}IPv6 включён и фаерволится UFW.${N} (для полного эффекта может понадобиться перезагрузка)"
     else
+        # Не отключаем IPv6, если у сервера нет глобального IPv4 — иначе оборвём SSH.
+        if ! ip -4 addr show scope global 2>/dev/null | grep -q "inet "; then
+            echo -e "${R}У сервера нет глобального IPv4 — отключение IPv6 оборвёт доступ по SSH. Отменено.${N}"
+            return
+        fi
+        local c
+        read -rp "$(echo -e "${Y}Точно отключить IPv6? Это может оборвать доступ [y/N]: ${N}")" c || return
+        [[ "${c:-}" =~ ^[yYдД] ]] || { echo -e "${GR}Отменено.${N}"; return; }
         printf 'net.ipv6.conf.all.disable_ipv6 = 1\nnet.ipv6.conf.default.disable_ipv6 = 1\n' > "$IPV6_CONF"
         sysctl -p "$IPV6_CONF" >/dev/null 2>&1
         echo -e "${Y}IPv6 отключён.${N}"
@@ -920,6 +972,7 @@ toggle_ipv6() {
 }
 
 toggle_icmp() {
+    clear; echo ""
     [[ -f "$BEFORE_RULES" ]] || { echo -e "${R}$BEFORE_RULES не найден.${N}"; return; }
     if grep -q 'icmp-type echo-request -j DROP' "$BEFORE_RULES"; then
         sed -i '/-A ufw-before-input -p icmp --icmp-type echo-request -m limit .*-j ACCEPT/d' "$BEFORE_RULES"
@@ -1084,25 +1137,33 @@ geo_reapply() {
 }
 
 menu_geoblock() {
-    echo -e "${C}=== Геоблокировка (только SSH) ===${N}"
-    geo_status
-    echo -e "${GR}ВНИМАНИЕ: применяется ТОЛЬКО к SSH-порту. Клиентский 443 не трогаем —"
-    echo -e "иначе отрежете своих пользователей из Ирана/России/Китая.${N}"
-    echo ""
-    echo "  1) Включить (рекоменд. набор, без RU/IR)"
-    echo "  2) Включить со своим списком стран"
-    echo "  3) Обновить базу IP"
-    echo "  4) Выключить"
-    echo "  0) Назад"
-    read -rp "> " a || return
-    case "${a:-}" in
-        1) geo_enable "$GEO_PRESET" ;;
-        2) read -rp "Коды стран через запятую (напр. CN,VN,IN): " cc || return
-           [[ -n "${cc:-}" ]] && geo_enable "$cc" ;;
-        3) if [[ -f "$GEO_COUNTRIES" ]]; then geo_enable "$(cat "$GEO_COUNTRIES")"; else echo -e "${Y}Сначала включите геоблок.${N}"; fi ;;
-        4) geo_disable ;;
-        *) : ;;
-    esac
+    local a cc
+    while true; do
+        hdr "Геоблокировка (только SSH)"
+        geo_status
+        echo ""
+        echo -e "  ${GR}Применяется ТОЛЬКО к SSH-порту. Клиентский 443 не трогаем,${N}"
+        echo -e "  ${GR}иначе отрежете своих пользователей из Ирана/России/Китая.${N}"
+        echo ""
+        echo "  1) Включить (рекоменд. набор, без RU/IR)"
+        echo "  2) Включить со своим списком стран"
+        echo "  3) Обновить базу IP"
+        echo "  4) Выключить"
+        echo ""
+        echo "  0) Назад"
+        read -rp "$PROMPT" a || return
+        case "${a:-}" in
+            1) geo_enable "$GEO_PRESET"; pause ;;
+            2) echo ""; read -rp "  Коды стран через запятую (напр. CN,VN,IN): " cc || continue
+               if [[ -n "${cc:-}" ]]; then geo_enable "$cc"; else echo -e "${Y}Ничего не введено.${N}"; fi
+               pause ;;
+            3) if [[ -f "$GEO_COUNTRIES" ]]; then geo_enable "$(cat "$GEO_COUNTRIES")"; else echo -e "${Y}Сначала включите геоблок.${N}"; fi
+               pause ;;
+            4) geo_disable; pause ;;
+            0|q|"") return ;;
+            *) echo -e "${Y}Неверный выбор.${N}"; sleep 1 ;;
+        esac
+    done
 }
 
 _syn_port() { [[ -r "$NODE_PORT_FILE" ]] && cat "$NODE_PORT_FILE" || echo ""; }
@@ -1193,24 +1254,33 @@ synproxy_disable() {
 }
 
 toggle_synproxy() {
-    local port; port=$(_syn_port)
+    local port a
+    port=$(_syn_port)
     if [[ -z "$port" ]]; then
-        read -rp "Порт для защиты SYNPROXY (порт ноды): " port || return
+        clear; echo ""; read -rp "  Порт для защиты SYNPROXY (порт ноды): " port || return
     fi
-    [[ "$port" =~ ^[0-9]+$ ]] || { echo -e "${R}Некорректный порт.${N}"; return; }
-    echo -e "${C}=== SYNPROXY (защита от SYN-флуда), порт ${port} ===${N}"
-    if _syn_enabled; then
-        echo -e "  Статус: ${G}включён${N}"
-        echo "  1) Выключить   0) Назад"
-        read -rp "> " a || return
-        [[ "${a:-}" == "1" ]] && synproxy_disable
-    else
-        echo -e "  Статус: ${GR}выключен${N}"
-        echo -e "${GR}Тяжёлая защита от SYN-флуда сверх syncookies. Требует поддержки ядра.${N}"
-        echo "  1) Включить   0) Назад"
-        read -rp "> " a || return
-        [[ "${a:-}" == "1" ]] && synproxy_enable "$port"
-    fi
+    [[ "$port" =~ ^[0-9]+$ ]] || { clear; echo ""; echo -e "${R}Некорректный порт.${N}"; pause; return; }
+    while true; do
+        hdr "SYNPROXY — анти-SYN-флуд (порт ${port})"
+        if _syn_enabled; then
+            echo -e "  Статус: ${G}включён${N}"
+            echo ""
+            echo "  1) Выключить"
+        else
+            echo -e "  Статус: ${GR}выключен${N}"
+            echo -e "  ${GR}Тяжёлая защита от SYN-флуда сверх syncookies. Требует поддержки ядра.${N}"
+            echo ""
+            echo "  1) Включить"
+        fi
+        echo ""
+        echo "  0) Назад"
+        read -rp "$PROMPT" a || return
+        case "${a:-}" in
+            1) if _syn_enabled; then synproxy_disable; else synproxy_enable "$port"; fi; pause ;;
+            0|q|"") return ;;
+            *) echo -e "${Y}Неверный выбор.${N}"; sleep 1 ;;
+        esac
+    done
 }
 
 # ---------- Psiphon (обход RU-метки IP, чтобы работал Gemini) ----------
@@ -1257,34 +1327,41 @@ XRAY
 }
 
 menu_psiphon() {
-    echo -e "${C}=== Psiphon (обход RU-метки IP, для Gemini) ===${N}"
-    if command -v vps-psiphon >/dev/null 2>&1; then
-        echo -e "  Статус: ${G}установлен${N}"
-        vps-psiphon status 2>/dev/null | head -n 20
-    else
-        echo -e "  Статус: ${GR}не установлен${N}"
-    fi
-    echo -e "${GR}Поднимает локальный SOCKS5 127.0.0.1:1080. Чтобы Gemini пошёл через него,"
-    echo -e "нужно добавить outbound+routing в конфиг Xray на панели (пункт 3).${N}"
-    echo ""
-    echo "  1) Установить (выход через Германию)"
-    echo "  2) Сменить страну выхода"
-    echo "  3) Показать outbound+routing для панели"
-    echo "  4) Логи Psiphon"
-    echo "  5) Удалить"
-    echo "  0) Назад"
-    read -rp "> " a || return
-    case "${a:-}" in
-        1) psi_install ;;
-        2) if command -v vps-psiphon >/dev/null 2>&1; then
-               read -rp "Код страны (DE, NL, US, auto): " r || return
-               [[ -n "${r:-}" ]] && vps-psiphon region "$r"
-           else echo -e "${Y}Сначала установите Psiphon.${N}"; fi ;;
-        3) psi_show_xray ;;
-        4) command -v vps-psiphon >/dev/null 2>&1 && vps-psiphon logs 50 || echo -e "${Y}Не установлен.${N}" ;;
-        5) command -v vps-psiphon >/dev/null 2>&1 && vps-psiphon uninstall || echo -e "${Y}Не установлен.${N}" ;;
-        *) : ;;
-    esac
+    local a r
+    while true; do
+        hdr "Psiphon — обход RU-метки IP (для Gemini)"
+        if command -v vps-psiphon >/dev/null 2>&1; then
+            echo -e "  Статус: ${G}установлен${N}"
+            vps-psiphon status 2>/dev/null | head -n 20
+        else
+            echo -e "  Статус: ${GR}не установлен${N}"
+        fi
+        echo ""
+        echo -e "  ${GR}Локальный SOCKS5 127.0.0.1:1080. Чтобы Gemini пошёл через него,${N}"
+        echo -e "  ${GR}добавьте outbound+routing в конфиг Xray на панели (пункт 3).${N}"
+        echo ""
+        echo "  1) Установить (выход через Германию)"
+        echo "  2) Сменить страну выхода"
+        echo "  3) Показать outbound+routing для панели"
+        echo "  4) Логи Psiphon"
+        echo "  5) Удалить"
+        echo ""
+        echo "  0) Назад"
+        read -rp "$PROMPT" a || return
+        case "${a:-}" in
+            1) psi_install; pause ;;
+            2) if command -v vps-psiphon >/dev/null 2>&1; then
+                   echo ""; read -rp "  Код страны (DE, NL, US, auto): " r || continue
+                   if [[ -n "${r:-}" ]]; then vps-psiphon region "$r"; else echo -e "${Y}Ничего не введено.${N}"; fi
+               else echo -e "${Y}Сначала установите Psiphon.${N}"; fi
+               pause ;;
+            3) psi_show_xray; pause ;;
+            4) if command -v vps-psiphon >/dev/null 2>&1; then vps-psiphon logs 50; else echo -e "${Y}Не установлен.${N}"; fi; pause ;;
+            5) if command -v vps-psiphon >/dev/null 2>&1; then vps-psiphon uninstall; else echo -e "${Y}Не установлен.${N}"; fi; pause ;;
+            0|q|"") return ;;
+            *) echo -e "${Y}Неверный выбор.${N}"; sleep 1 ;;
+        esac
+    done
 }
 
 # ---------- Selfsteal (маскировка Reality, обёртка скрипта DigneZzZ) ----------
@@ -1305,7 +1382,7 @@ ss_install() {
     ufw reload >/dev/null 2>&1 || true
     echo -e "${GR}Свой серт из certwarden при желании: добавьте --ssl-cert/--ssl-key к команде selfsteal вручную.${N}"
     local t; t=$(mktemp)
-    if ! curl -Ls "$SS_URL" -o "$t"; then rm -f "$t"; echo -e "${R}Не удалось скачать selfsteal.sh${N}"; return 1; fi
+    if ! curl -fLs "$SS_URL" -o "$t"; then rm -f "$t"; echo -e "${R}Не удалось скачать selfsteal.sh${N}"; return 1; fi
     if [[ "$mode" == "nginx" ]]; then
         bash "$t" @ --nginx --tcp --force --domain "$domain" install
     else
@@ -1343,33 +1420,38 @@ SSX
 }
 
 menu_selfsteal() {
-    echo -e "${C}=== Selfsteal (маскировка Reality) ===${N}"
-    if command -v selfsteal >/dev/null 2>&1; then
-        echo -e "  Статус: ${G}установлен${N}"
-    else
-        echo -e "  Статус: ${GR}не установлен${N}"
-    fi
-    echo -e "${GR}Веб-сервер-обманка для Reality; порт 443 остаётся за Xray.${N}"
-    echo ""
-    echo "  1) Установить (Caddy — проще)"
-    echo "  2) Установить (Nginx — тише под пробингом РКН)"
-    echo "  3) Статус"
-    echo "  4) Логи"
-    echo "  5) Перевыпустить сертификат"
-    echo "  6) Показать конфиг Xray для панели"
-    echo "  7) Удалить"
-    echo "  0) Назад"
-    read -rp "> " a || return
-    case "${a:-}" in
-        1) ss_install caddy ;;
-        2) ss_install nginx ;;
-        3) command -v selfsteal >/dev/null 2>&1 && selfsteal status || echo -e "${Y}Не установлен.${N}" ;;
-        4) command -v selfsteal >/dev/null 2>&1 && selfsteal logs || echo -e "${Y}Не установлен.${N}" ;;
-        5) command -v selfsteal >/dev/null 2>&1 && selfsteal renew-ssl || echo -e "${Y}Не установлен.${N}" ;;
-        6) ss_show_xray ;;
-        7) command -v selfsteal >/dev/null 2>&1 && selfsteal uninstall || echo -e "${Y}Не установлен.${N}" ;;
-        *) : ;;
-    esac
+    local a
+    while true; do
+        hdr "Selfsteal — маскировка Reality"
+        if command -v selfsteal >/dev/null 2>&1; then
+            echo -e "  Статус: ${G}установлен${N}"
+        else
+            echo -e "  Статус: ${GR}не установлен${N}"
+        fi
+        echo -e "  ${GR}Веб-сервер-обманка для Reality; порт 443 остаётся за Xray.${N}"
+        echo ""
+        echo "  1) Установить (Caddy — проще)"
+        echo "  2) Установить (Nginx — тише под пробингом РКН)"
+        echo "  3) Статус"
+        echo "  4) Логи"
+        echo "  5) Перевыпустить сертификат"
+        echo "  6) Показать конфиг Xray для панели"
+        echo "  7) Удалить"
+        echo ""
+        echo "  0) Назад"
+        read -rp "$PROMPT" a || return
+        case "${a:-}" in
+            1) ss_install caddy; pause ;;
+            2) ss_install nginx; pause ;;
+            3) if command -v selfsteal >/dev/null 2>&1; then selfsteal status; else echo -e "${Y}Не установлен.${N}"; fi; pause ;;
+            4) if command -v selfsteal >/dev/null 2>&1; then selfsteal logs; else echo -e "${Y}Не установлен.${N}"; fi; pause ;;
+            5) if command -v selfsteal >/dev/null 2>&1; then selfsteal renew-ssl; else echo -e "${Y}Не установлен.${N}"; fi; pause ;;
+            6) ss_show_xray; pause ;;
+            7) if command -v selfsteal >/dev/null 2>&1; then selfsteal uninstall; else echo -e "${Y}Не установлен.${N}"; fi; pause ;;
+            0|q|"") return ;;
+            *) echo -e "${Y}Неверный выбор.${N}"; sleep 1 ;;
+        esac
+    done
 }
 
 # ---------- Кастомный Xray-core ----------
@@ -1438,18 +1520,26 @@ xray_install_version() {
     local arch; arch=$(_xray_arch)
     [[ -n "$arch" ]] || { echo -e "${R}Архитектура $(uname -m) не поддерживается.${N}"; return 1; }
     command -v unzip >/dev/null 2>&1 || apt-get install -y -qq unzip >/dev/null 2>&1 || true
+    if ! command -v unzip >/dev/null 2>&1; then echo -e "${R}Не найден unzip и не удалось его установить. Установите unzip и повторите.${N}"; return 1; fi
     local url="https://github.com/XTLS/Xray-core/releases/download/${ver}/Xray-linux-${arch}.zip"
     echo -e "${C}Скачиваю Xray-core ${ver} (${arch})...${N}"
     local tmp; tmp=$(mktemp -d)
     if ! curl -fsSL "$url" -o "$tmp/x.zip"; then rm -rf "$tmp"; echo -e "${R}Не скачалось: $url${N}"; return 1; fi
     mkdir -p /opt/remnanode
-    if ! unzip -o "$tmp/x.zip" xray -d /opt/remnanode >/dev/null 2>&1; then rm -rf "$tmp"; echo -e "${R}В архиве нет бинарника xray.${N}"; return 1; fi
+    if ! unzip -o "$tmp/x.zip" xray -d /opt/remnanode >/dev/null 2>&1; then rm -rf "$tmp"; echo -e "${R}В архиве нет бинарника xray (или архив повреждён).${N}"; return 1; fi
     rm -rf "$tmp"; chmod +x "$XRAY_BIN"
     _xray_add_mount
     echo -e "${C}Пересоздаю контейнер...${N}"
-    ( cd /opt/remnanode && docker compose up -d --force-recreate ) >/dev/null 2>&1 || true
+    if ! ( cd /opt/remnanode && docker compose up -d --force-recreate ) >/dev/null 2>&1; then
+        echo -e "${R}Не удалось пересоздать контейнер (см. cd /opt/remnanode && docker compose logs).${N}"; return 1
+    fi
     sleep 4
-    echo -e "${G}Готово. Версия Xray в контейнере: $(_xray_cver).${N}"
+    local cv; cv=$(_xray_cver)
+    if [[ -n "$cv" ]]; then
+        echo -e "${G}Готово. Версия Xray в контейнере: ${cv}.${N}"
+    else
+        echo -e "${R}Контейнер не поднялся / Xray не отвечает (см. cd /opt/remnanode && docker compose logs).${N}"; return 1
+    fi
 }
 
 xray_revert() {
@@ -1646,7 +1736,7 @@ success "Команда nodectl установлена (наберите: nodect
 #===============================================================================
 # ИТОГ
 #===============================================================================
-clear
+echo ""
 echo -e "${GREEN}========================================${RESET}"
 echo -e "${GREEN}         ИТОГ АВТО-УСТАНОВКИ            ${RESET}"
 echo -e "${GREEN}========================================${RESET}"
