@@ -24,7 +24,7 @@
 Выполните на сервере (скрипт спросит SSH-порт, секретный ключ ноды и порт ноды):
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/LumaxDev/remnanode-installer/main/install.sh)
+bash <(curl -sL https://raw.githubusercontent.com/feauche/remnanode-installer/main/install.sh)
 ```
 
 > ⚠️ **Важно:** `Secret Key` и `Node Port`, которые вы вводите, должны **совпадать** с тем,

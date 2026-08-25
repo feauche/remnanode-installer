@@ -1367,6 +1367,26 @@ menu_selfsteal() {
     esac
 }
 
+node_restart() {
+    [[ -f /opt/remnanode/docker-compose.yml ]] || { echo -e "${R}Нода не установлена (/opt/remnanode).${N}"; return 1; }
+    echo -e "${C}Перезапускаю ноду...${N}"
+    if ( cd /opt/remnanode && docker compose restart ) >/dev/null 2>&1; then
+        echo -e "${G}Нода перезапущена.${N}"
+    else
+        echo -e "${R}Не удалось перезапустить (см. docker compose logs).${N}"
+    fi
+}
+
+node_update() {
+    [[ -f /opt/remnanode/docker-compose.yml ]] || { echo -e "${R}Нода не установлена (/opt/remnanode).${N}"; return 1; }
+    echo -e "${C}Обновляю образ ноды (тег из docker-compose.yml)...${N}"
+    if ( cd /opt/remnanode && docker compose pull && docker compose up -d ) >/dev/null 2>&1; then
+        echo -e "${G}Готово.${N} Тег latest → нода обновлена до свежей; фиксированная версия (напр. 2.8.0) → осталась на ней."
+    else
+        echo -e "${R}Обновление не удалось (см. cd /opt/remnanode && docker compose logs).${N}"
+    fi
+}
+
 node_uninstall() {
     if [[ ! -d /opt/remnanode ]] && ! docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
         echo -e "${Y}Нода не обнаружена.${N}"; return
@@ -1392,9 +1412,11 @@ show_logs() {
 
 usage() {
     cat <<U
-nodectl — управление безопасностью ноды
+nodectl — управление нодой и безопасностью
   nodectl            интерактивное меню (по умолчанию)
   nodectl status     показать статус
+  nodectl restart    перезапустить ноду
+  nodectl update     обновить ноду (до тега из docker-compose.yml)
 U
 }
 
@@ -1444,6 +1466,8 @@ cmd="${1:-menu}"
 case "$cmd" in
     status)      need_root; show_status ;;
     menu|"")     need_root; main_menu ;;
+    restart)     need_root; node_restart ;;
+    update)      need_root; node_update ;;
     geo-reapply) need_root; geo_reapply ;;
     -h|--help)   usage ;;
     *)           usage; exit 1 ;;
