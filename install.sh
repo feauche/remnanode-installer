@@ -901,9 +901,9 @@ show_status() {
         printf "  %-24s %b\n" "ICMP ping" "${G}разрешён${N}"
     fi
     if ipset list "$GEO_SET" -terse &>/dev/null; then
-        printf "  %-24s %b\n" "геоблок SSH" "${G}включён${N}"
+        printf "  %-24s %b\n" "геоблок (все порты)" "${G}включён${N}"
     else
-        printf "  %-24s %b\n" "геоблок SSH" "${GR}выключен${N}"
+        printf "  %-24s %b\n" "геоблок (все порты)" "${GR}выключен${N}"
     fi
     if _syn_enabled; then
         printf "  %-24s %b\n" "SYNPROXY" "${G}включён${N}"
@@ -1096,7 +1096,7 @@ SV
 geo_status() {
     if ipset list "$GEO_SET" -terse &>/dev/null; then
         local n; n=$(ipset list "$GEO_SET" -terse 2>/dev/null | grep -Fi "Number of entries" | awk '{print $NF}')
-        echo -e "  Геоблок: ${G}включён${N} (${n:-0} подсетей, только SSH-порт $(_geo_ssh_port))"
+        echo -e "  Геоблок: ${G}включён${N} (${n:-0} подсетей, весь сервер — все порты)"
         [[ -f "$GEO_COUNTRIES" ]] && echo -e "  Страны:  ${GR}$(cat "$GEO_COUNTRIES")${N}"
     else
         echo -e "  Геоблок: ${GR}выключен${N}"
@@ -1109,7 +1109,7 @@ geo_enable() {
     _geo_build "$countries" || return 1
     _geo_add_rule || return 1
     _geo_make_service
-    echo -e "${G}Геоблокировка включена (только SSH-порт $(_geo_ssh_port)).${N}"
+    echo -e "${G}Геоблокировка включена (весь сервер, все порты).${N}"
 }
 
 geo_disable() {
@@ -1139,11 +1139,12 @@ geo_reapply() {
 menu_geoblock() {
     local a cc
     while true; do
-        hdr "Геоблокировка (только SSH)"
+        hdr "Геоблокировка (весь сервер)"
         geo_status
         echo ""
-        echo -e "  ${GR}Применяется ТОЛЬКО к SSH-порту. Клиентский 443 не трогаем,${N}"
-        echo -e "  ${GR}иначе отрежете своих пользователей из Ирана/России/Китая.${N}"
+        echo -e "  ${GR}Полностью блокирует выбранные страны на ВСЕХ портах сервера.${N}"
+        echo -e "  ${R}НЕ добавляйте страны своих VPN-клиентов — иначе отрежете их совсем${N}"
+        echo -e "  ${R}(RU и IR в рекомендованный набор НЕ входят).${N}"
         echo ""
         echo "  1) Включить (рекоменд. набор, без RU/IR)"
         echo "  2) Включить со своим списком стран"
@@ -1651,17 +1652,33 @@ node_uninstall() {
 }
 
 show_logs() {
+    clear
     echo -e "${C}Последние блокировки UFW:${N}"
     grep -i 'BLOCK' /var/log/ufw.log 2>/dev/null | tail -20 || echo "лог UFW пуст/недоступен"
+}
+
+# Обновление самого скрипта: заново скачивает установщик и запускает его.
+# Установщик идемпотентен и при существующей ноде её НЕ трогает (ключ/порт/версия
+# сохраняются) — обновляются лишь закалка и сама команда nodectl.
+SELF_URL="https://raw.githubusercontent.com/feauche/remnanode-installer/main/install.sh"
+node_selfupdate() {
+    echo -e "${C}Обновляю скрипт (nodectl + закалка) из GitHub...${N}"
+    local t; t=$(mktemp)
+    if ! curl -fsSL "$SELF_URL" -o "$t"; then rm -f "$t"; echo -e "${R}Не удалось скачать install.sh.${N}"; return 1; fi
+    echo -e "${GR}Существующая нода и её секретный ключ сохранятся. Спросит только SSH-порт (Enter — оставить как есть).${N}"
+    echo ""
+    bash "$t" </dev/tty
+    rm -f "$t"
 }
 
 usage() {
     cat <<U
 nodectl — управление нодой и безопасностью
-  nodectl            интерактивное меню (по умолчанию)
-  nodectl status     показать статус
-  nodectl restart    перезапустить ноду
-  nodectl update     обновить ноду (до тега из docker-compose.yml)
+  nodectl              интерактивное меню (по умолчанию)
+  nodectl status       показать статус
+  nodectl restart      перезапустить ноду
+  nodectl update       обновить ноду (до тега из docker-compose.yml)
+  nodectl update-self  обновить сам скрипт nodectl из GitHub
 U
 }
 
@@ -1730,6 +1747,7 @@ case "$cmd" in
     menu|"")     need_root; main_menu ;;
     restart)     need_root; node_restart ;;
     update)      need_root; node_update ;;
+    update-self) need_root; node_selfupdate ;;
     geo-reapply) need_root; geo_reapply ;;
     -h|--help)   usage ;;
     *)           usage; exit 1 ;;
