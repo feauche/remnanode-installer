@@ -1046,15 +1046,15 @@ PY
 _geo_add_rule() {
     [[ -f "$BEFORE_RULES" ]] || { echo -e "${R}$BEFORE_RULES не найден.${N}"; return 1; }
     command -v python3 >/dev/null 2>&1 || apt-get install -y -qq python3 >/dev/null 2>&1 || true
-    local ssh_port; ssh_port=$(_geo_ssh_port)
     _geo_del_rule
-    python3 - "$BEFORE_RULES" "$GEO_MARK" "$GEO_SET" "$ssh_port" <<'PY'
+    # Полный блок выбранных стран: дроп ВСЕГО входящего с этих подсетей (все порты/протоколы).
+    python3 - "$BEFORE_RULES" "$GEO_MARK" "$GEO_SET" <<'PY'
 import sys, re
-f, mark, s, port = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+f, mark, s = sys.argv[1], sys.argv[2], sys.argv[3]
 begin="# %s-geo-begin"%mark; end="# %s-geo-end"%mark
 c=open(f).read()
 c=re.sub(r'\n'+re.escape(begin)+r'.*?'+re.escape(end)+r'\n','\n',c,flags=re.DOTALL)
-block="\n%s\n-A ufw-before-input -p tcp --dport %s -m set --match-set %s src -j DROP\n%s\n"%(begin,port,s,end)
+block="\n%s\n-A ufw-before-input -m set --match-set %s src -j DROP\n%s\n"%(begin,s,end)
 i=c.rfind("COMMIT")
 c=c[:i]+block+c[i:] if i!=-1 else c+block
 open(f,'w').write(c)
