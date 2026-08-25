@@ -1666,47 +1666,60 @@ U
 }
 
 main_menu() {
-    local psi_c ss_c
+    local psi_c ss_c ch geo_b ipv6_b icmp_b psi_b ss_b xray_b
     while true; do
         clear
-        command -v vps-psiphon >/dev/null 2>&1 && psi_c="$G" || psi_c="$R"
-        command -v selfsteal   >/dev/null 2>&1 && ss_c="$G"  || ss_c="$R"
-        echo -e "${C}============= nodectl =============${N}"
-        show_status
+        # Psiphon / Selfsteal: цвет пункта + метка справа.
+        if command -v vps-psiphon >/dev/null 2>&1; then psi_c="$G"; psi_b="${G}(установлено)${N}"; else psi_c="$R"; psi_b="${R}(не установлено)${N}"; fi
+        if command -v selfsteal   >/dev/null 2>&1; then ss_c="$G";  ss_b="${G}(установлено)${N}";  else ss_c="$R";  ss_b="${R}(не установлено)${N}"; fi
+        # Геоблок.
+        if ipset list "$GEO_SET" -terse &>/dev/null; then geo_b="${G}✅ включён${N}"; else geo_b="${GR}⚪ выключен${N}"; fi
+        # IPv6: ✅ если включён, ❌ если отключён.
+        if sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q 1; then ipv6_b="${R}❌ отключён${N}"; else ipv6_b="${G}✅ включён${N}"; fi
+        # ICMP: ✅ если пинг разрешён, ❌ если ограничен.
+        if grep -q 'icmp-type echo-request -j DROP' "$BEFORE_RULES" 2>/dev/null; then icmp_b="${R}❌ ограничен${N}"; else icmp_b="${G}✅ разрешён${N}"; fi
+        # Xray-core: из образа / вручную / нет ноды.
+        if [[ ! -f "$NODE_COMPOSE" ]]; then xray_b="${GR}(нет ноды)${N}"
+        elif _xray_custom_on; then xray_b="${Y}(вручную)${N}"
+        else xray_b="${G}(из образа)${N}"; fi
+
+        echo ""
+        echo -e "  ${C}N O D E C T L${N}"
+        echo -e "  ${GR}управление нодой и безопасностью${N}"
         echo ""
         echo -e "${GR}──── 🔒 Безопасность ────${N}"
-        echo "  1) 🛡️  Fail2Ban (баны SSH)"
-        echo "  2) 🌍 Геоблокировка по странам"
-        echo "  3) 🔀 IPv6 вкл/выкл"
-        echo "  4) 📡 ICMP пинг вкл/выкл"
-        echo "  5) 🧱 SYNPROXY (анти-SYN-флуд)"
+        echo -e "  1) 🛡️  Fail2Ban (баны SSH)"
+        echo -e "  2) 🌍 Геоблокировка по странам   ${geo_b}"
+        echo -e "  3) 🔀 IPv6 вкл/выкл   ${ipv6_b}"
+        echo -e "  4) 📡 ICMP пинг вкл/выкл   ${icmp_b}"
+        echo -e "  5) 🧱 SYNPROXY (анти-SYN-флуд)"
         echo ""
-        echo "  6) 📜 Логи firewall"
+        echo -e "  6) 📜 Логи firewall"
         echo ""
         echo -e "${GR}──── 📦 Установки ────${N}"
-        echo -e "  7) ${psi_c}🌀 Psiphon (обход RU-метки, для Gemini)${N}"
-        echo -e "  8) ${ss_c}🎭 Selfsteal (маскировка Reality)${N}"
+        echo -e "  7) ${psi_c}🌀 Psiphon (обход RU-метки, для Gemini)${N}   ${psi_b}"
+        echo -e "  8) ${ss_c}🎭 Selfsteal (маскировка Reality)${N}   ${ss_b}"
         echo ""
         echo -e "${GR}──── 🖥️  Нода ────${N}"
-        echo "  9) 🧬 Xray-core (своя версия / дефолт)"
-        echo "  u) 🗑️  Удалить ноду (полностью)"
-        echo -e "${GR}     перезапуск/обновление: nodectl restart | nodectl update${N}"
+        echo -e "  9) 🧬 Xray-core (своя версия / дефолт)   ${xray_b}"
+        echo -e "  u) 🗑️  Удалить ноду (полностью)"
+        echo -e "${GR}     ещё: nodectl restart · nodectl update · nodectl update-self${N}"
         echo ""
         echo "  0) Выход"
-        read -rp "> " ch || exit 0
+        read -rp "$PROMPT" ch || exit 0
         case "${ch:-}" in
-            1) menu_fail2ban; pause ;;
-            2) menu_geoblock; pause ;;
+            1) menu_fail2ban ;;
+            2) menu_geoblock ;;
             3) toggle_ipv6; pause ;;
             4) toggle_icmp; pause ;;
-            5) toggle_synproxy; pause ;;
+            5) toggle_synproxy ;;
             6) show_logs; pause ;;
-            7) menu_psiphon; pause ;;
-            8) menu_selfsteal; pause ;;
+            7) menu_psiphon ;;
+            8) menu_selfsteal ;;
             9) menu_xray ;;
             u|U) node_uninstall; pause ;;
             0|q) exit 0 ;;
-            *) : ;;
+            *) echo -e "${Y}Неверный выбор.${N}"; sleep 1 ;;
         esac
     done
 }
