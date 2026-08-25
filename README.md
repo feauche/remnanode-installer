@@ -59,7 +59,7 @@ bash <(curl -sL https://raw.githubusercontent.com/feauche/remnanode-installer/ma
 ```
 🔒 Безопасность
   1) Fail2Ban (баны SSH)
-  2) Геоблокировка по странам (только SSH)
+  2) Геоблокировка по странам (весь сервер — все порты)
   3) IPv6 вкл/выкл
   4) ICMP пинг вкл/выкл
   5) SYNPROXY (усиленная защита от SYN-флуда)
