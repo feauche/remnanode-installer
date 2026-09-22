@@ -106,744 +106,13 @@ function confirm() {
 function validate_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
 
 #===============================================================================
-# Предварительные проверки
+# Установка команды nodectl (используется и при полной установке, и в режиме
+# `install.sh --update-nodectl`, который вызывает `nodectl update-self`).
 #===============================================================================
-if [[ $EUID -ne 0 ]]; then
-    error "Скрипт должен быть запущен от имени root (используйте sudo)."
-fi
-
-if ! command -v apt-get >/dev/null 2>&1; then
-    error "Поддерживаются только Debian/Ubuntu (apt-get не найден)."
-fi
-
-# --- Непрозрачные имена файлов (обфускация) ---
-# Файлы, которые создаёт скрипт, получают имена-хэши без слов вроде "node"/
-# "hardening" — так по ним нельзя понять, что на сервере стоит нода. Хэш
-# детерминирован (от machine-id данного сервера), поэтому уникален на каждом
-# сервере и стабилен при повторном запуске — то же имя перезаписывается, дублей
-# конфигов не возникает.
-_MACHINE_SEED="$(cat /etc/machine-id 2>/dev/null || hostname 2>/dev/null || echo seed)"
-tok() { printf '%s' "${_MACHINE_SEED}:$1" | sha256sum | cut -c1-12; }
-
-SSHPORT_CONF="/etc/ssh/sshd_config.d/99-$(tok sshport).conf"
-HARDEN_CONF="/etc/sysctl.d/99-$(tok harden).conf"
-BOOST_CONF="/etc/sysctl.d/99-$(tok boost).conf"
-IPV6_CONF="/etc/sysctl.d/98-$(tok ipv6).conf"
-DOCKER_MARK="$(tok dmark)"
-
-# --- Проверка: не установлена ли уже нода (чтобы не поставить вторую) ---
-# Имена наших файлов рандомные, поэтому существование ноды определяем по
-# стандартным артефактам самой Remnawave, а не по нашим файлам.
-NODE_EXISTS=0
-NODE_EVIDENCE=""
-if [[ -f /opt/remnanode/docker-compose.yml ]]; then
-    NODE_EXISTS=1; NODE_EVIDENCE="файл /opt/remnanode/docker-compose.yml"
-elif command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode'; then
-    NODE_EXISTS=1; NODE_EVIDENCE="docker-контейнер remnanode"
-elif command -v remnanode >/dev/null 2>&1; then
-    NODE_EXISTS=1; NODE_EVIDENCE="команда remnanode в системе"
-fi
-
-#===============================================================================
-# ОПРОС: собираем все параметры заранее (дальше — без вопросов)
-#===============================================================================
-step "Опрос: параметры установки"
-
-if [[ $NODE_EXISTS -eq 1 ]]; then
-    warn "На сервере уже обнаружена нода (${NODE_EVIDENCE})."
-    warn "Повторная установка ноды выполнена НЕ будет — второй экземпляр не ставим."
-    info "Можно продолжить, чтобы применить/обновить только закалку сервера и firewall."
-    if ! confirm "Продолжить (только закалка, без установки ноды)?" "y"; then
-        info "Отмена."
-        exit 0
-    fi
-    echo ""
-fi
-
-# --- Текущий SSH-порт: sshd_config.d > sshd_config > что реально слушает ss ---
-detect_ssh_port() {
-    local p
-    p=$(grep -h "^Port " /etc/ssh/sshd_config.d/*.conf 2>/dev/null | tail -1 | awk '{print $2}')
-    [[ -z "$p" ]] && p=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
-    [[ -z "$p" ]] && p=$(ss -tlnp 2>/dev/null | grep -E "sshd|ssh" | awk '{print $4}' | grep -oE '[0-9]+$' | head -1)
-    echo "${p:-22}"
-}
-
-CURRENT_SSH_PORT=$(detect_ssh_port)
-info "Текущий SSH-порт обнаружен: ${CYAN}${CURRENT_SSH_PORT}${RESET}"
-
-SSH_PORT=$(ask "На каком порту должен быть SSH (Enter = оставить как есть)" "$CURRENT_SSH_PORT")
-if ! validate_port "$SSH_PORT"; then
-    error "Некорректный SSH-порт: '$SSH_PORT' (нужно 1–65535)."
-fi
-
-SECRET_KEY=""
-if [[ $NODE_EXISTS -eq 0 ]]; then
-    echo ""
-    info "Секретный ключ ноды: Панель → Nodes → Add Node → Secret Key"
-    SECRET_KEY=$(ask_required "Секретный ключ ноды")
-    # Убираем возможные обрамляющие кавычки (панель показывает секрет и в кавычках).
-    SECRET_KEY="${SECRET_KEY%\"}"; SECRET_KEY="${SECRET_KEY#\"}"
-fi
-
-if [[ $NODE_EXISTS -eq 1 ]]; then
-    # Нода уже стоит — порт не спрашиваем, берём из её docker-compose.yml (нужен для UFW).
-    NODE_PORT=$(grep -oE 'NODE_PORT=[0-9]+' /opt/remnanode/docker-compose.yml 2>/dev/null | head -1 | cut -d= -f2)
-    [[ -n "${NODE_PORT:-}" ]] || NODE_PORT="$DEFAULT_NODE_PORT"
-    info "Порт ноды взят из установленной ноды: ${CYAN}${NODE_PORT}${RESET}"
-else
-    NODE_PORT=$(ask "Порт ноды" "$DEFAULT_NODE_PORT")
-    if ! validate_port "$NODE_PORT"; then
-        error "Некорректный порт ноды: '$NODE_PORT' (нужно 1–65535)."
-    fi
-fi
-
-# Версия образа ноды. У remnawave/node нет «скользящего» тега 2 — фиксируем
-# latest (ветка 3.x, для панели 3+) либо конкретную 2.8.0 (последняя в ветке 2.x,
-# для панели до версии 3). Выбор зависит от версии панели, а не от «стабильности».
-NODE_VERSION="latest"
-if [[ $NODE_EXISTS -eq 0 ]]; then
-    echo ""
-    info "Версия ноды (должна соответствовать версии панели Remnawave):"
-    info "  1) latest — для новой панели версии 3 и выше"
-    info "  2) 2.8.0  — для панели версии до 3 (ветка 2.x)"
-    _vchoice=$(ask "Выберите версию (1/2)" "1")
-    case "$_vchoice" in
-        2|2.8|2.8.0) NODE_VERSION="2.8.0" ;;
-        *)           NODE_VERSION="latest" ;;
-    esac
-    success "Версия ноды: ${NODE_VERSION}"
-fi
-
-# --- Сводка + подтверждение ---
-echo ""
-echo -e "${YELLOW}========================================${RESET}"
-echo -e "${YELLOW}СВОДКА:${RESET}"
-if [[ "$SSH_PORT" != "$CURRENT_SSH_PORT" ]]; then
-    echo -e "  SSH порт:        ${RED}${CURRENT_SSH_PORT} → ${SSH_PORT}${RESET} ${YELLOW}(будет миграция!)${RESET}"
-else
-    echo -e "  SSH порт:        ${CYAN}${SSH_PORT}${RESET} ${GRAY}(без изменений)${RESET}"
-fi
-if [[ -n "$SECRET_KEY" ]]; then
-    echo -e "  Секретный ключ:  ${GRAY}${SECRET_KEY:0:24}…${RESET}"
-fi
-echo -e "  Порт ноды:       ${CYAN}${NODE_PORT}${RESET}"
-if [[ $NODE_EXISTS -eq 0 ]]; then
-    echo -e "  Версия ноды:     ${CYAN}${NODE_VERSION}${RESET}"
-fi
-echo -e "${YELLOW}========================================${RESET}"
-echo ""
-
-if [[ "$SSH_PORT" != "$CURRENT_SSH_PORT" ]]; then
-    warn "Будет миграция SSH с порта ${CURRENT_SSH_PORT} на ${SSH_PORT}."
-    warn "После миграции переподключитесь: ${CYAN}ssh -p ${SSH_PORT} <user>@<server>${RESET}"
-    warn "Если миграция не удастся — авто-откат на ${CURRENT_SSH_PORT}."
-    echo ""
-fi
-
-if ! confirm "Запускаю автоматическую настройку?" "y"; then
-    info "Отмена."
-    exit 0
-fi
-
-#===============================================================================
-# Обновление системы (перед всем остальным)
-#===============================================================================
-step "Обновление системы (apt update + upgrade)..."
-export DEBIAN_FRONTEND=noninteractive
-export NEEDRESTART_MODE=a
-apt-get update -y >/dev/null 2>&1 || warn "apt update завершился с ошибкой — продолжаю."
-if apt-get -y -o Dpkg::Options::=--force-confold upgrade >/dev/null 2>&1; then
-    success "Система обновлена."
-else
-    warn "apt upgrade завершился с ошибкой — продолжаю."
-fi
-
-# effective_ssh_port — порт, на котором SSH РЕАЛЬНО слушает после шага 2
-EFFECTIVE_SSH_PORT="$CURRENT_SSH_PORT"
-
-#===============================================================================
-# ШАГ 1/10 — UFW Firewall: установка
-#===============================================================================
-step "Шаг 1/10: UFW Firewall — установка"
-if command -v ufw >/dev/null 2>&1; then
-    success "UFW уже установлен."
-    step_ok "1/10 UFW"
-else
-    info "Устанавливаю UFW..."
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq >/dev/null 2>&1
-    if apt-get install -y -qq ufw >/dev/null 2>&1; then
-        success "UFW установлен."
-        step_ok "1/10 UFW"
-    else
-        error "Не удалось установить UFW — без него дальнейшая настройка бессмысленна."
-    fi
-fi
-
-#===============================================================================
-# ШАГ 2/10 — Миграция SSH (если нужна) + правила UFW + включение
-#===============================================================================
-step "Шаг 2/10: Миграция SSH + конфигурация UFW"
-
-if [[ "$SSH_PORT" != "$CURRENT_SSH_PORT" ]]; then
-    info "Мигрирую SSH с ${CURRENT_SSH_PORT} на ${SSH_PORT}..."
-    SSHD_BACKUP="/etc/ssh/sshd_config.bak.$(tok sshbak).$(date +%s)"
-    cp /etc/ssh/sshd_config "$SSHD_BACKUP"
-
-    # 1. Основной конфиг
-    sed -i -e "s/^#*Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
-    if ! grep -q "^Port " /etc/ssh/sshd_config; then
-        echo "Port $SSH_PORT" | tee -a /etc/ssh/sshd_config >/dev/null
-    fi
-
-    # 2. sshd_config.d (приоритет на современных системах)
-    if [[ -d /etc/ssh/sshd_config.d ]]; then
-        echo "Port $SSH_PORT" | tee "$SSHPORT_CONF" >/dev/null
-    fi
-
-    # 3. Ubuntu 24+: портом рулит ssh.socket
-    MIGRATION_OK=0
-    if systemctl is-active --quiet ssh.socket 2>/dev/null; then
-        info "Обнаружен ssh.socket (Ubuntu 24+), правлю systemd unit..."
-        mkdir -p /etc/systemd/system/ssh.socket.d
-        cat > /etc/systemd/system/ssh.socket.d/override.conf <<SOCKET_EOF
-[Socket]
-ListenStream=
-ListenStream=0.0.0.0:${SSH_PORT}
-ListenStream=[::]:${SSH_PORT}
-SOCKET_EOF
-        systemctl daemon-reload
-        if systemctl restart ssh.socket && systemctl restart ssh.service; then
-            MIGRATION_OK=1
-        fi
-    else
-        systemctl daemon-reload 2>/dev/null || true
-        if systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; then
-            MIGRATION_OK=1
-        fi
-    fi
-
-    if [[ $MIGRATION_OK -eq 1 ]]; then
-        sleep 5
-        if ss -tlnH 2>/dev/null | awk -v p="${SSH_PORT}" '{n=split($4,a,":"); if (a[n]==p) f=1} END{exit !f}'; then
-            success "SSH теперь слушает порт ${SSH_PORT}."
-            EFFECTIVE_SSH_PORT="$SSH_PORT"
-        else
-            MIGRATION_OK=0
-            warn "SSH перезапустился, но не слушает ${SSH_PORT}. Откатываю..."
-        fi
-    fi
-
-    if [[ $MIGRATION_OK -eq 0 ]]; then
-        warn "Миграция SSH не удалась. Откатываю на ${CURRENT_SSH_PORT}..."
-        mv "$SSHD_BACKUP" /etc/ssh/sshd_config
-        rm -f "$SSHPORT_CONF" 2>/dev/null
-        rm -rf /etc/systemd/system/ssh.socket.d 2>/dev/null
-        systemctl daemon-reload 2>/dev/null || true
-        systemctl restart ssh.socket 2>/dev/null || true
-        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
-        EFFECTIVE_SSH_PORT="$CURRENT_SSH_PORT"
-        step_fail "2/10 SSH-миграция (откат, продолжаю на порту ${CURRENT_SSH_PORT})"
-    fi
-else
-    success "SSH остаётся на порту ${CURRENT_SSH_PORT}."
-fi
-
-info "Сбрасываю старые правила UFW..."
-ufw --force reset >/dev/null
-info "Default политики: deny incoming, allow outgoing..."
-ufw default deny incoming >/dev/null
-ufw default allow outgoing >/dev/null
-if [[ -f /etc/default/ufw ]] && grep -q "^IPV6=yes" /etc/default/ufw; then
-    sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw
-fi
-# По умолчанию открываем ТОЛЬКО SSH и порт ноды (порт ноды — для всех).
-# Клиентский порт 443 откроется позже, на этапе установки selfsteal/ноды.
-info "Открываю порты: SSH=${EFFECTIVE_SSH_PORT}/tcp, порт ноды=${NODE_PORT}/tcp (для всех)..."
-ufw allow "${EFFECTIVE_SSH_PORT}"/tcp comment 'ssh' >/dev/null
-ufw allow "${NODE_PORT}"/tcp comment 'app' >/dev/null
-info "Включаю UFW..."
-if echo "y" | ufw enable >/dev/null 2>&1; then
-    success "UFW активирован, SSH доступен на порту ${EFFECTIVE_SSH_PORT}."
-    step_ok "2/10 UFW config"
-else
-    step_fail "2/10 ufw enable"
-fi
-
-#===============================================================================
-# ШАГ 3/10 — Fail2Ban
-#===============================================================================
-step "Шаг 3/10: Fail2Ban"
-if ! command -v fail2ban-client >/dev/null 2>&1; then
-    info "Устанавливаю Fail2Ban..."
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get install -y -qq fail2ban >/dev/null 2>&1 || true
-else
-    success "Fail2Ban уже установлен."
-fi
-if command -v fail2ban-client >/dev/null 2>&1; then
-    F2B_LOGPATH="/var/log/auth.log"
-    F2B_BACKEND="auto"
-    if [[ ! -f "$F2B_LOGPATH" ]] && command -v journalctl >/dev/null 2>&1; then
-        F2B_LOGPATH="SYSLOG"
-        F2B_BACKEND="systemd"
-    fi
-    info "Пишу /etc/fail2ban/jail.local (bantime=1ч, maxretry=5, findtime=600с, port=${EFFECTIVE_SSH_PORT})..."
-    tee /etc/fail2ban/jail.local >/dev/null <<JAIL
-[DEFAULT]
-bantime = 3600
-findtime = 600s
-maxretry = 5
-backend = $F2B_BACKEND
-ignoreip = 127.0.0.1/8 ::1
-
-[sshd]
-enabled = true
-port = $EFFECTIVE_SSH_PORT
-filter = sshd
-logpath = $F2B_LOGPATH
-JAIL
-    systemctl enable fail2ban >/dev/null 2>&1 || true
-    systemctl restart fail2ban
-    sleep 1
-    if systemctl is-active --quiet fail2ban; then
-        success "Fail2Ban запущен, защищает порт ${EFFECTIVE_SSH_PORT}."
-        step_ok "3/10 Fail2Ban"
-    else
-        step_fail "3/10 fail2ban service не стартовал"
-    fi
-else
-    step_fail "3/10 fail2ban не установился"
-fi
-
-#===============================================================================
-# ШАГ 4/10 — Kernel Hardening
-#===============================================================================
-step "Шаг 4/10: Kernel Hardening"
-SYSCTL_HARDEN="$HARDEN_CONF"
-info "Пишу $SYSCTL_HARDEN..."
-tee "$SYSCTL_HARDEN" >/dev/null <<'SYSCTL_HARDEN_EOF'
-# network / kernel security tuning
-# --- SYN Flood Protection ---
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_synack_retries = 3
-net.ipv4.tcp_syn_retries = 3
-net.ipv4.tcp_max_syn_backlog = 65535
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 32768
-
-# --- IP Spoofing & Network Attack Protection ---
-net.ipv4.conf.all.accept_source_route = 0
-net.ipv4.conf.default.accept_source_route = 0
-net.ipv4.conf.all.rp_filter = 2
-net.ipv4.conf.default.rp_filter = 2
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv4.conf.all.secure_redirects = 0
-net.ipv4.conf.default.secure_redirects = 0
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-net.ipv4.conf.all.log_martians = 1
-net.ipv6.conf.all.accept_redirects = 0
-net.ipv6.conf.default.accept_redirects = 0
-net.ipv4.icmp_echo_ignore_broadcasts = 1
-net.ipv4.icmp_ignore_bogus_error_responses = 1
-
-# --- TCP Tuning ---
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 20
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_probes = 5
-net.ipv4.tcp_keepalive_intvl = 15
-
-# --- Kernel Security ---
-kernel.randomize_va_space = 2
-kernel.dmesg_restrict = 1
-kernel.yama.ptrace_scope = 1
-kernel.kptr_restrict = 2
-fs.protected_symlinks = 1
-fs.protected_hardlinks = 1
-fs.suid_dumpable = 0
-SYSCTL_HARDEN_EOF
-if sysctl -p "$SYSCTL_HARDEN" >/dev/null 2>&1; then
-    success "Kernel Hardening применён."
-    step_ok "4/10 Kernel Hardening"
-else
-    step_fail "4/10 sysctl -p hardening"
-fi
-
-#===============================================================================
-# ШАГ 5/10 — Сеть, производительность и лимиты
-#===============================================================================
-step "Шаг 5/10: Сеть, производительность и лимиты"
-
-# Congestion control: BBR. Родной для него qdisc — fq (cake намеренно НЕ берём:
-# он режет пиковую скорость ради справедливости между клиентами).
-modprobe tcp_bbr >/dev/null 2>&1 || true
-# hashsize задаём ДО загрузки модуля (иначе применится только после ребута).
-echo "nf_conntrack" > "/etc/modules-load.d/$(tok ct).conf"
-echo "options nf_conntrack hashsize=262144" > "/etc/modprobe.d/$(tok ct).conf"
-modprobe nf_conntrack >/dev/null 2>&1 || true
-
-info "Пишу $BOOST_CONF (BBR + fq, буферы 32M, лимиты соединений, conntrack)..."
-tee "$BOOST_CONF" >/dev/null <<EOF_NET
-# network performance & scale tuning
-# --- скорость / пропускная способность ---
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_moderate_rcvbuf = 1
-net.core.rmem_max = 33554432
-net.core.wmem_max = 33554432
-net.ipv4.tcp_rmem = 4096 87380 33554432
-net.ipv4.tcp_wmem = 4096 65536 33554432
-
-# --- масштаб: тысячи одновременных клиентов ---
-fs.file-max = 2000000
-net.ipv4.ip_local_port_range = 10000 65535
-# Порты наших слушающих сервисов исключаем из эфемерного диапазона, чтобы
-# исходящие соединения случайно не заняли их (иначе конфликт).
-net.ipv4.ip_local_reserved_ports = ${EFFECTIVE_SSH_PORT},${NODE_PORT}
-net.ipv4.tcp_max_tw_buckets = 1440000
-
-# --- conntrack: не переполнять таблицу соединений при тысячах клиентов ---
-net.netfilter.nf_conntrack_max = 1048576
-net.netfilter.nf_conntrack_tcp_timeout_established = 3600
-net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
-EOF_NET
-
-if sysctl -p "$BOOST_CONF" >/dev/null 2>&1; then
-    success "Сеть настроена (BBR + fq, буферы 32M, лимиты соединений)."
-    step_ok "5/10 Сеть и лимиты"
-else
-    warn "Часть параметров (conntrack) применится после перезагрузки — не критично."
-    step_ok "5/10 Сеть и лимиты (частично)"
-fi
-
-# LimitNOFILE для docker.service: без этого нода упрётся в лимит дескрипторов
-# под нагрузкой. Drop-in подхватится, когда Docker установят (на шаге ноды).
-mkdir -p /etc/systemd/system/docker.service.d
-cat > /etc/systemd/system/docker.service.d/override.conf <<'DOCKER_LIMIT_EOF'
-[Service]
-LimitNOFILE=1048576
-LimitNPROC=1048576
-DOCKER_LIMIT_EOF
-success "Лимит дескрипторов для Docker подготовлен (LimitNOFILE=1048576)."
-
-#===============================================================================
-# ШАГ 6/10 — Отключение IPv6
-#===============================================================================
-step "Шаг 6/10: Отключение IPv6"
-if ! ip -4 addr show scope global 2>/dev/null | grep -q "inet "; then
-    warn "У сервера нет глобального IPv4 — отключение IPv6 оборвёт доступ. Пропускаю."
-    step_fail "6/10 IPv6 (пропущено: сервер, похоже, IPv6-only)"
-else
-    tee "$IPV6_CONF" >/dev/null <<'EOF_NO6'
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-EOF_NO6
-    if sysctl -p "$IPV6_CONF" >/dev/null 2>&1; then
-        success "IPv6 отключён."
-        step_ok "6/10 IPv6 off"
-    else
-        step_fail "6/10 sysctl -p ipv6"
-    fi
-fi
-
-#===============================================================================
-# ШАГ 7/10 — Firewall: анти-флуд + ICMP
-#===============================================================================
-step "Шаг 7/10: Firewall — анти-флуд + ICMP"
-BEFORE_RULES="/etc/ufw/before.rules"
-FLOOD_MARK="$(tok fw)"
-if [[ -f "$BEFORE_RULES" ]]; then
-    cp "$BEFORE_RULES" "${BEFORE_RULES}.bak.$(tok fwbak).$(date +%s)"
-
-    # 1) ICMP echo-request: rate-limit ВМЕСТО полного дропа. destination-unreachable
-    #    (в т.ч. fragmentation-needed для PMTUD), time-exceeded и parameter-problem
-    #    не трогаем — их блок ломает передачу крупных пакетов.
-    if grep -q -- '-A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT' "$BEFORE_RULES"; then
-        sed -i 's|-A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT|-A ufw-before-input -p icmp --icmp-type echo-request -m limit --limit 10/second --limit-burst 20 -j ACCEPT\n-A ufw-before-input -p icmp --icmp-type echo-request -j DROP|' "$BEFORE_RULES"
-    fi
-
-    # 2) Анти-флуд блок в ufw-before-input: дроп INVALID и битых TCP-флагов (сканы)
-    #    + per-IP лимит новых SYN на порт ноды. Идемпотентно (по маркеру).
-    command -v python3 >/dev/null 2>&1 || apt-get install -y -qq python3 >/dev/null 2>&1 || true
-    python3 - "$BEFORE_RULES" "$FLOOD_MARK" "$NODE_PORT" <<'PYEOF'
-import sys, re
-rules_file, mark, node_port = sys.argv[1], sys.argv[2], sys.argv[3]
-begin = "# %s-flood-begin" % mark
-end   = "# %s-flood-end" % mark
-with open(rules_file) as f:
-    content = f.read()
-content = re.sub(r'\n' + re.escape(begin) + r'.*?' + re.escape(end) + r'\n', '\n', content, flags=re.DOTALL)
-block = (
-    "\n" + begin + "\n"
-    "-A ufw-before-input -m conntrack --ctstate INVALID -j DROP\n"
-    "-A ufw-before-input -p tcp --tcp-flags ALL NONE -j DROP\n"
-    "-A ufw-before-input -p tcp --tcp-flags ALL ALL -j DROP\n"
-    "-A ufw-before-input -p tcp --tcp-flags FIN,SYN FIN,SYN -j DROP\n"
-    "-A ufw-before-input -p tcp --tcp-flags SYN,RST SYN,RST -j DROP\n"
-    "-A ufw-before-input -p tcp --dport " + node_port + " --syn -m hashlimit "
-    "--hashlimit-name synflood --hashlimit-mode srcip --hashlimit-above 30/sec "
-    "--hashlimit-burst 60 -j DROP\n"
-    + end + "\n"
-)
-i = content.rfind("COMMIT")
-content = content[:i] + block + content[i:] if i != -1 else content + block
-with open(rules_file, "w") as f:
-    f.write(content)
-print("OK")
-PYEOF
-
-    ufw reload >/dev/null 2>&1 || true
-    success "Анти-флуд активен: дроп INVALID/битых флагов, лимит SYN на порт ноды, ICMP rate-limit."
-    step_ok "7/10 Firewall анти-флуд"
-else
-    warn "$BEFORE_RULES не найден — пропуск."
-    step_fail "7/10 before.rules не найден"
-fi
-
-#===============================================================================
-# ШАГ 8/10 — Авто-обновления безопасности + системные журналы
-#===============================================================================
-step "Шаг 8/10: Авто-обновления безопасности + журналы"
-
-# Авто-обновления: ставим ТОЛЬКО security-патчи, без авто-перезагрузки.
-info "Настраиваю автоматические обновления безопасности..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get install -y -qq unattended-upgrades >/dev/null 2>&1 || true
-if [[ -d /etc/apt/apt.conf.d ]]; then
-    cat > /etc/apt/apt.conf.d/20auto-upgrades <<'AU_EOF'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-AU_EOF
-    cat > /etc/apt/apt.conf.d/52-unattended-local <<'AU_EOF2'
-Unattended-Upgrade::Automatic-Reboot "false";
-AU_EOF2
-    success "Авто-обновления безопасности включены (без авто-ребута)."
-else
-    warn "Каталог /etc/apt/apt.conf.d не найден — пропуск авто-обновлений."
-fi
-
-# journald persistent: журналы переживают перезагрузку (нужно для разбора
-# инцидентов), с лимитом размера чтобы не переполнить диск.
-info "Включаю постоянное хранение системных журналов..."
-mkdir -p /etc/systemd/journald.conf.d /var/log/journal
-cat > "/etc/systemd/journald.conf.d/$(tok journal).conf" <<'JRN_EOF'
-[Journal]
-Storage=persistent
-SystemMaxUse=500M
-JRN_EOF
-systemctl restart systemd-journald 2>/dev/null || true
-success "journald: постоянное хранение включено (лимит 500M)."
-
-step_ok "8/10 Авто-обновления + журналы"
-
-#===============================================================================
-# ШАГ 9/10 — Установка Remnanode
-#===============================================================================
-step "Шаг 9/10: Установка Remnanode"
-if [[ $NODE_EXISTS -eq 1 ]]; then
-    warn "Нода уже установлена (${NODE_EVIDENCE}) — установку пропускаю, второй экземпляр не ставлю."
-    SETUP_DONE+=("9/10 Remnanode (уже установлена — пропущено)")
-else
-    node_ok=1
-    while :; do
-        # 1) Docker (официальный установщик get.docker.com)
-        if ! command -v docker >/dev/null 2>&1; then
-            info "Устанавливаю Docker (get.docker.com, может занять пару минут)..."
-            curl -fsSL https://get.docker.com -o /tmp/_getdocker.sh 2>/dev/null && sh /tmp/_getdocker.sh >/dev/null 2>&1
-            rm -f /tmp/_getdocker.sh
-        fi
-        if ! command -v docker >/dev/null 2>&1; then
-            warn "Docker не установился."; node_ok=0; break
-        fi
-        systemctl daemon-reload 2>/dev/null || true
-        systemctl enable --now docker >/dev/null 2>&1 || true
-        systemctl restart docker >/dev/null 2>&1 || true   # применить LimitNOFILE drop-in (шаг 5)
-        if ! docker info >/dev/null 2>&1; then
-            warn "Docker установлен, но демон не запущен."; node_ok=0; break
-        fi
-        success "Docker готов."
-
-        # 2) docker-compose.yml (официальный формат + наши лимиты логов)
-        info "Создаю /opt/remnanode/docker-compose.yml (образ remnawave/node:${NODE_VERSION})..."
-        mkdir -p /opt/remnanode
-        cat > /opt/remnanode/docker-compose.yml <<EOF
-services:
-  remnanode:
-    image: remnawave/node:${NODE_VERSION}
-    container_name: remnanode
-    hostname: remnanode
-    network_mode: host
-    restart: always
-    cap_add:
-      - NET_ADMIN
-    ulimits:
-      nofile:
-        soft: 1048576
-        hard: 1048576
-    logging:
-      driver: json-file
-      options:
-        max-size: "30m"
-        max-file: "5"
-    environment:
-      - NODE_PORT=${NODE_PORT}
-      - SECRET_KEY="${SECRET_KEY}"
-EOF
-        chmod 0600 /opt/remnanode/docker-compose.yml
-
-        # 3) Поднять контейнер и дождаться запуска
-        info "Поднимаю контейнер ноды..."
-        ( cd /opt/remnanode && docker compose up -d ) >/dev/null 2>&1 || true
-        _w=0
-        while [[ $_w -lt 120 ]]; do
-            docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$' && break
-            sleep 3; _w=$((_w + 3))
-        done
-        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
-            node_ok=1
-        else
-            warn "Контейнер remnanode не поднялся за ${_w}с (логи: cd /opt/remnanode && docker compose logs)."
-            node_ok=0
-        fi
-        break
-    done
-    if [[ $node_ok -eq 1 ]]; then
-        success "Нода remnanode запущена (remnawave/node:${NODE_VERSION}, порт ${NODE_PORT})."
-        step_ok "9/10 Remnanode"
-    else
-        step_fail "9/10 Remnanode (не установилась — см. сообщения выше)"
-    fi
-fi
-
-#===============================================================================
-# ШАГ 10/10 — Docker + UFW Professional Fix (авто)
-#===============================================================================
-# Docker по умолчанию пишет правила напрямую в iptables в обход UFW, из-за чего
-# опубликованные порты контейнеров открыты, даже если UFW стоит на DENY. Этот
-# фикс направляет трафик контейнеров через DOCKER-USER → ufw-user-forward.
-step "Шаг 10/10: Docker + UFW Fix"
-apply_docker_ufw_fix() {
-    if ! command -v python3 >/dev/null 2>&1; then
-        info "Устанавливаю python3 (нужен для правки after.rules)..."
-        apt-get install -y -qq python3 >/dev/null 2>&1 || true
-    fi
-
-    # 1. Разрешаем Docker-подсети
-    ufw allow from 172.16.0.0/12 comment 'Docker networks' >/dev/null 2>&1 || true
-    ufw allow from 192.168.0.0/16 comment 'Docker bridge' >/dev/null 2>&1 || true
-
-    local after_rules="/etc/ufw/after.rules"
-    local marker_start="# ${DOCKER_MARK}-begin"
-    local marker_end="# ${DOCKER_MARK}-end"
-    if [[ ! -f "$after_rules" ]]; then
-        warn "$after_rules не найден — пропускаю Docker UFW Fix."
-        return 1
-    fi
-
-    local iface
-    iface=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5}' | head -1)
-    iface=${iface:-eth0}
-
-    # Если блок уже есть — удаляем старую версию перед вставкой свежей
-    if grep -q "$marker_start" "$after_rules"; then
-        info "Обновляю существующий блок Docker UFW Fix..."
-        python3 - <<PYEOF
-import re
-with open('${after_rules}', 'r') as f:
-    content = f.read()
-content = re.sub(r'\n${marker_start}.*?${marker_end}\n', '', content, flags=re.DOTALL)
-with open('${after_rules}', 'w') as f:
-    f.write(content)
-PYEOF
-    fi
-
-    # Дописываем блок ОТДЕЛЬНОЙ секцией *filter ... COMMIT в конец файла.
-    # Почему так: ufw-init грузит файлы в порядке before.rules → after.rules → user.rules,
-    # а свои цепочки ufw-user-* создаёт только ПОСЛЕ after.rules. Если сослаться на
-    # ufw-user-forward, не объявив её, `ufw enable` после `ufw disable` падает с
-    # "Chain 'ufw-user-forward' does not exist". Объявление `:ufw-user-forward - [0:0]`
-    # при restore с -n безопасно: существующая цепочка не сбрасывается (как в ufw-docker).
-    python3 - "$after_rules" "$marker_start" "$marker_end" "$iface" <<'PYEOF'
-import sys
-rules_file, marker_s, marker_e, iface = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-with open(rules_file, 'r') as f:
-    content = f.read()
-
-docker_block = f"""
-{marker_s}
-# Эти правила заставляют Docker-трафик проходить через фильтрацию UFW.
-# Отдельная секция *filter: ufw создаёт ufw-user-forward уже после after.rules,
-# поэтому цепочку объявляем сами (с -n существующая цепочка не сбрасывается).
-*filter
-:ufw-user-forward - [0:0]
-:DOCKER-USER - [0:0]
--A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
--A DOCKER-USER -i {iface} -p udp -m udp --sport 53 --dport 1024:65535 -j RETURN
--A DOCKER-USER -i {iface} -j ufw-user-forward
--A DOCKER-USER -i {iface} -j DROP
--A DOCKER-USER -j RETURN
-COMMIT
-{marker_e}
-"""
-
-content = content.rstrip('\n') + '\n' + docker_block
-with open(rules_file, 'w') as f:
-    f.write(content)
-print('OK')
-PYEOF
-    local rc=$?
-    if [[ $rc -ne 0 ]]; then
-        warn "Не удалось вставить блок в after.rules."
-        return 1
-    fi
-    success "Блок Docker UFW Fix добавлен в ${after_rules} (интерфейс: ${iface})."
-
-    # Синхронизируем route-правила только если Docker уже установлен
-    if command -v docker >/dev/null 2>&1; then
-        info "Синхронизирую порты Docker-контейнеров с UFW route..."
-        local docker_ports ufw_in_ports p
-        docker_ports=$(docker ps --format "{{.Ports}}" 2>/dev/null | grep -oE '0.0.0.0:[0-9]+' | cut -d: -f2 | sort -u)
-        ufw_in_ports=$(ufw status | grep "ALLOW" | grep -v "(v6)" | awk '{print $1}' | grep -oE '^[0-9]+' | sort -u)
-        for p in $ufw_in_ports; do
-            if echo "$docker_ports" | grep -qx "$p"; then
-                ufw route allow "$p" >/dev/null 2>&1 || true
-            else
-                ufw route delete allow "$p" >/dev/null 2>&1 || true
-            fi
-        done
-    else
-        info "Docker ещё не установлен — правила after.rules готовы, порты синхронизируются после установки ноды."
-    fi
-    local reload_out
-    if reload_out=$(ufw reload 2>&1); then
-        return 0
-    else
-        warn "ufw reload завершился с ошибкой, блок Docker UFW Fix мог не примениться:"
-        echo "$reload_out" | sed 's/^/    /'
-        return 1
-    fi
-}
-
-if apply_docker_ufw_fix; then
-    success "Docker + UFW Fix применён."
-    step_ok "10/10 Docker UFW Fix"
-else
-    step_fail "10/10 Docker UFW Fix"
-fi
-
-#===============================================================================
-# Установка команды управления nodectl
-#===============================================================================
-step "Установка команды управления nodectl..."
-
-cat > /usr/local/bin/nodectl <<'NODECTL_EOF'
+install_nodectl() {
+    # Пишем во временный файл и подменяем через mv: запущенный `nodectl update-self`
+    # продолжает читать свою старую копию (старый inode), а не новый файл.
+    cat > /usr/local/bin/nodectl.new <<'NODECTL_EOF'
 #!/usr/bin/env bash
 # nodectl — управление безопасностью сервера-ноды
 set -uo pipefail
@@ -1671,18 +940,27 @@ show_logs() {
     grep -i 'BLOCK' /var/log/ufw.log 2>/dev/null | tail -20 || echo "лог UFW пуст/недоступен"
 }
 
-# Обновление самого скрипта: заново скачивает установщик и запускает его.
-# Установщик идемпотентен и при существующей ноде её НЕ трогает (ключ/порт/версия
-# сохраняются) — обновляются лишь закалка и сама команда nodectl.
+# Обновление самого скрипта: скачивает свежий install.sh и запускает его в режиме
+# --update-nodectl. Этот режим переустанавливает ТОЛЬКО команду nodectl: закалка,
+# UFW (включая ручные правила), fail2ban и нода не трогаются.
 SELF_URL="https://raw.githubusercontent.com/feauche/remnanode-installer/main/install.sh"
 node_selfupdate() {
-    echo -e "${C}Обновляю скрипт (nodectl + закалка) из GitHub...${N}"
+    echo -e "${C}Обновляю команду nodectl из GitHub (закалка и firewall не трогаются)...${N}"
     local t; t=$(mktemp)
     if ! curl -fsSL "$SELF_URL" -o "$t"; then rm -f "$t"; echo -e "${R}Не удалось скачать install.sh.${N}"; return 1; fi
-    echo -e "${GR}Существующая нода и её секретный ключ сохранятся. Спросит только SSH-порт (Enter — оставить как есть).${N}"
-    echo ""
-    bash "$t" </dev/tty
+    if ! grep -q -- '--update-nodectl' "$t"; then
+        rm -f "$t"
+        echo -e "${R}Скачанный install.sh не поддерживает режим --update-nodectl. Обновите вручную:${N}"
+        echo -e "${GR}bash <(curl -sL $SELF_URL)${N}"
+        return 1
+    fi
+    bash "$t" --update-nodectl </dev/tty
     rm -f "$t"
+    echo ""
+    echo -e "${G}nodectl обновлён.${N} Запустите ${C}nodectl${N} заново."
+    # Выходим сразу: файл nodectl только что перезаписан, дочитывать старый
+    # процесс из нового файла нельзя (bash читает скрипт по мере выполнения).
+    exit 0
 }
 
 usage() {
@@ -1692,8 +970,9 @@ nodectl — управление нодой и безопасностью
   nodectl status       показать статус
   nodectl restart      перезапустить ноду
   nodectl update       обновить ноду (до тега из docker-compose.yml)
-  nodectl update-self  обновить сам nodectl и закалку (повторный запуск install.sh из GitHub)
+  nodectl update-self  обновить только сам nodectl из GitHub (закалка и UFW не трогаются)
 Все команды доступны и как пункты меню.
+Полная закалка заново: bash <(curl -sL $SELF_URL)
 U
 }
 
@@ -1740,7 +1019,7 @@ main_menu() {
         echo ""
         echo -e "${GR}──── 🧰 Скрипт ────${N}"
         echo -e "  i) 📊 Статус сервера"
-        echo -e "  s) ⬇️  Обновить nodectl и закалку (install.sh из GitHub)"
+        echo -e "  s) ⬇️  Обновить nodectl (только скрипт, из GitHub)"
         echo ""
         echo "  0) Выход"
         read -rp "$PROMPT" ch || exit 0
@@ -1758,9 +1037,7 @@ main_menu() {
             n|N) node_update; pause ;;
             u|U) node_uninstall; pause ;;
             i|I) show_status; pause ;;
-            s|S) node_selfupdate; pause
-                 # После обновления перезапускаем уже новую версию nodectl.
-                 exec /usr/local/bin/nodectl ;;
+            s|S) node_selfupdate ;;
             0|q) exit 0 ;;
             *) echo -e "${Y}Неверный выбор.${N}"; sleep 1 ;;
         esac
@@ -1779,9 +1056,778 @@ case "$cmd" in
     *)           usage; exit 1 ;;
 esac
 NODECTL_EOF
-chmod 0755 /usr/local/bin/nodectl
-# Порт ноды сохраняем, чтобы nodectl знал, что защищать SYNPROXY.
-echo "$NODE_PORT" > "/etc/$(tok np).port"; chmod 0600 "/etc/$(tok np).port"
+    chmod 0755 /usr/local/bin/nodectl.new
+    mv -f /usr/local/bin/nodectl.new /usr/local/bin/nodectl
+
+    # Порт ноды сохраняем, чтобы nodectl знал, что защищать SYNPROXY.
+    # В режиме --update-nodectl NODE_PORT не опрашивается: берём его из compose ноды,
+    # и только если файла ещё нет.
+    local port_file="/etc/$(tok np).port" p=""
+    if [[ -n "${NODE_PORT:-}" ]]; then
+        p="$NODE_PORT"
+    elif [[ ! -f "$port_file" && -f /opt/remnanode/docker-compose.yml ]]; then
+        p=$(grep -oE 'NODE_PORT=[0-9]+' /opt/remnanode/docker-compose.yml | head -1 | cut -d= -f2)
+    fi
+    if [[ -n "$p" ]]; then
+        echo "$p" > "$port_file"; chmod 0600 "$port_file"
+    fi
+}
+
+
+#===============================================================================
+# Предварительные проверки
+#===============================================================================
+if [[ $EUID -ne 0 ]]; then
+    error "Скрипт должен быть запущен от имени root (используйте sudo)."
+fi
+
+if ! command -v apt-get >/dev/null 2>&1; then
+    error "Поддерживаются только Debian/Ubuntu (apt-get не найден)."
+fi
+
+# --- Непрозрачные имена файлов (обфускация) ---
+# Файлы, которые создаёт скрипт, получают имена-хэши без слов вроде "node"/
+# "hardening" — так по ним нельзя понять, что на сервере стоит нода. Хэш
+# детерминирован (от machine-id данного сервера), поэтому уникален на каждом
+# сервере и стабилен при повторном запуске — то же имя перезаписывается, дублей
+# конфигов не возникает.
+_MACHINE_SEED="$(cat /etc/machine-id 2>/dev/null || hostname 2>/dev/null || echo seed)"
+tok() { printf '%s' "${_MACHINE_SEED}:$1" | sha256sum | cut -c1-12; }
+
+SSHPORT_CONF="/etc/ssh/sshd_config.d/99-$(tok sshport).conf"
+HARDEN_CONF="/etc/sysctl.d/99-$(tok harden).conf"
+BOOST_CONF="/etc/sysctl.d/99-$(tok boost).conf"
+IPV6_CONF="/etc/sysctl.d/98-$(tok ipv6).conf"
+DOCKER_MARK="$(tok dmark)"
+
+# --- Режим «только обновить nodectl» (его вызывает `nodectl update-self`) ---
+# Закалку, UFW, fail2ban и ноду не трогает: переустанавливает лишь команду nodectl.
+if [[ "${1:-}" == "--update-nodectl" ]]; then
+    step "Обновление команды nodectl (закалка и firewall не трогаются)"
+    install_nodectl
+    success "Команда nodectl обновлена."
+    info "Полная закалка заново (все шаги): запустите установщик без параметров."
+    exit 0
+fi
+
+# --- Проверка: не установлена ли уже нода (чтобы не поставить вторую) ---
+# Имена наших файлов рандомные, поэтому существование ноды определяем по
+# стандартным артефактам самой Remnawave, а не по нашим файлам.
+NODE_EXISTS=0
+NODE_EVIDENCE=""
+if [[ -f /opt/remnanode/docker-compose.yml ]]; then
+    NODE_EXISTS=1; NODE_EVIDENCE="файл /opt/remnanode/docker-compose.yml"
+elif command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode'; then
+    NODE_EXISTS=1; NODE_EVIDENCE="docker-контейнер remnanode"
+elif command -v remnanode >/dev/null 2>&1; then
+    NODE_EXISTS=1; NODE_EVIDENCE="команда remnanode в системе"
+fi
+
+#===============================================================================
+# ОПРОС: собираем все параметры заранее (дальше — без вопросов)
+#===============================================================================
+step "Опрос: параметры установки"
+
+if [[ $NODE_EXISTS -eq 1 ]]; then
+    warn "На сервере уже обнаружена нода (${NODE_EVIDENCE})."
+    warn "Повторная установка ноды выполнена НЕ будет — второй экземпляр не ставим."
+    info "Это режим обновления: нода, её ключ, порт и версия не трогаются."
+    info "Будут обновлены закалка сервера, firewall (включая Docker UFW Fix) и команда nodectl."
+    info "Ручные правила UFW сохраняются. Только обновить nodectl: nodectl update-self."
+    if ! confirm "Продолжить в режиме обновления (без установки ноды)?" "y"; then
+        info "Отмена."
+        exit 0
+    fi
+    echo ""
+fi
+
+# --- Текущий SSH-порт: sshd_config.d > sshd_config > что реально слушает ss ---
+detect_ssh_port() {
+    local p
+    p=$(grep -h "^Port " /etc/ssh/sshd_config.d/*.conf 2>/dev/null | tail -1 | awk '{print $2}')
+    [[ -z "$p" ]] && p=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+    [[ -z "$p" ]] && p=$(ss -tlnp 2>/dev/null | grep -E "sshd|ssh" | awk '{print $4}' | grep -oE '[0-9]+$' | head -1)
+    echo "${p:-22}"
+}
+
+CURRENT_SSH_PORT=$(detect_ssh_port)
+info "Текущий SSH-порт обнаружен: ${CYAN}${CURRENT_SSH_PORT}${RESET}"
+
+SSH_PORT=$(ask "На каком порту должен быть SSH (Enter = оставить как есть)" "$CURRENT_SSH_PORT")
+if ! validate_port "$SSH_PORT"; then
+    error "Некорректный SSH-порт: '$SSH_PORT' (нужно 1–65535)."
+fi
+
+SECRET_KEY=""
+if [[ $NODE_EXISTS -eq 0 ]]; then
+    echo ""
+    info "Секретный ключ ноды: Панель → Nodes → Add Node → Secret Key"
+    SECRET_KEY=$(ask_required "Секретный ключ ноды")
+    # Убираем возможные обрамляющие кавычки (панель показывает секрет и в кавычках).
+    SECRET_KEY="${SECRET_KEY%\"}"; SECRET_KEY="${SECRET_KEY#\"}"
+fi
+
+if [[ $NODE_EXISTS -eq 1 ]]; then
+    # Нода уже стоит — порт не спрашиваем, берём из её docker-compose.yml (нужен для UFW).
+    NODE_PORT=$(grep -oE 'NODE_PORT=[0-9]+' /opt/remnanode/docker-compose.yml 2>/dev/null | head -1 | cut -d= -f2)
+    [[ -n "${NODE_PORT:-}" ]] || NODE_PORT="$DEFAULT_NODE_PORT"
+    info "Порт ноды взят из установленной ноды: ${CYAN}${NODE_PORT}${RESET}"
+else
+    NODE_PORT=$(ask "Порт ноды" "$DEFAULT_NODE_PORT")
+    if ! validate_port "$NODE_PORT"; then
+        error "Некорректный порт ноды: '$NODE_PORT' (нужно 1–65535)."
+    fi
+fi
+
+# Версия образа ноды. У remnawave/node нет «скользящего» тега 2 — фиксируем
+# latest (ветка 3.x, для панели 3+) либо конкретную 2.8.0 (последняя в ветке 2.x,
+# для панели до версии 3). Выбор зависит от версии панели, а не от «стабильности».
+NODE_VERSION="latest"
+if [[ $NODE_EXISTS -eq 0 ]]; then
+    echo ""
+    info "Версия ноды (должна соответствовать версии панели Remnawave):"
+    info "  1) latest — для новой панели версии 3 и выше"
+    info "  2) 2.8.0  — для панели версии до 3 (ветка 2.x)"
+    _vchoice=$(ask "Выберите версию (1/2)" "1")
+    case "$_vchoice" in
+        2|2.8|2.8.0) NODE_VERSION="2.8.0" ;;
+        *)           NODE_VERSION="latest" ;;
+    esac
+    success "Версия ноды: ${NODE_VERSION}"
+fi
+
+# --- Сводка + подтверждение ---
+echo ""
+echo -e "${YELLOW}========================================${RESET}"
+echo -e "${YELLOW}СВОДКА:${RESET}"
+if [[ "$SSH_PORT" != "$CURRENT_SSH_PORT" ]]; then
+    echo -e "  SSH порт:        ${RED}${CURRENT_SSH_PORT} → ${SSH_PORT}${RESET} ${YELLOW}(будет миграция!)${RESET}"
+else
+    echo -e "  SSH порт:        ${CYAN}${SSH_PORT}${RESET} ${GRAY}(без изменений)${RESET}"
+fi
+if [[ -n "$SECRET_KEY" ]]; then
+    echo -e "  Секретный ключ:  ${GRAY}${SECRET_KEY:0:24}…${RESET}"
+fi
+echo -e "  Порт ноды:       ${CYAN}${NODE_PORT}${RESET}"
+if [[ $NODE_EXISTS -eq 0 ]]; then
+    echo -e "  Версия ноды:     ${CYAN}${NODE_VERSION}${RESET}"
+fi
+echo -e "${YELLOW}========================================${RESET}"
+echo ""
+
+if [[ "$SSH_PORT" != "$CURRENT_SSH_PORT" ]]; then
+    warn "Будет миграция SSH с порта ${CURRENT_SSH_PORT} на ${SSH_PORT}."
+    warn "После миграции переподключитесь: ${CYAN}ssh -p ${SSH_PORT} <user>@<server>${RESET}"
+    warn "Если миграция не удастся — авто-откат на ${CURRENT_SSH_PORT}."
+    echo ""
+fi
+
+if ! confirm "Запускаю автоматическую настройку?" "y"; then
+    info "Отмена."
+    exit 0
+fi
+
+#===============================================================================
+# Обновление системы (перед всем остальным)
+#===============================================================================
+step "Обновление системы (apt update + upgrade)..."
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+apt-get update -y >/dev/null 2>&1 || warn "apt update завершился с ошибкой — продолжаю."
+if apt-get -y -o Dpkg::Options::=--force-confold upgrade >/dev/null 2>&1; then
+    success "Система обновлена."
+else
+    warn "apt upgrade завершился с ошибкой — продолжаю."
+fi
+
+# effective_ssh_port — порт, на котором SSH РЕАЛЬНО слушает после шага 2
+EFFECTIVE_SSH_PORT="$CURRENT_SSH_PORT"
+
+#===============================================================================
+# ШАГ 1/10 — UFW Firewall: установка
+#===============================================================================
+step "Шаг 1/10: UFW Firewall — установка"
+if command -v ufw >/dev/null 2>&1; then
+    success "UFW уже установлен."
+    step_ok "1/10 UFW"
+else
+    info "Устанавливаю UFW..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq >/dev/null 2>&1
+    if apt-get install -y -qq ufw >/dev/null 2>&1; then
+        success "UFW установлен."
+        step_ok "1/10 UFW"
+    else
+        error "Не удалось установить UFW — без него дальнейшая настройка бессмысленна."
+    fi
+fi
+
+#===============================================================================
+# ШАГ 2/10 — Миграция SSH (если нужна) + правила UFW + включение
+#===============================================================================
+step "Шаг 2/10: Миграция SSH + конфигурация UFW"
+
+if [[ "$SSH_PORT" != "$CURRENT_SSH_PORT" ]]; then
+    info "Мигрирую SSH с ${CURRENT_SSH_PORT} на ${SSH_PORT}..."
+    SSHD_BACKUP="/etc/ssh/sshd_config.bak.$(tok sshbak).$(date +%s)"
+    cp /etc/ssh/sshd_config "$SSHD_BACKUP"
+
+    # 1. Основной конфиг
+    sed -i -e "s/^#*Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
+    if ! grep -q "^Port " /etc/ssh/sshd_config; then
+        echo "Port $SSH_PORT" | tee -a /etc/ssh/sshd_config >/dev/null
+    fi
+
+    # 2. sshd_config.d (приоритет на современных системах)
+    if [[ -d /etc/ssh/sshd_config.d ]]; then
+        echo "Port $SSH_PORT" | tee "$SSHPORT_CONF" >/dev/null
+    fi
+
+    # 3. Ubuntu 24+: портом рулит ssh.socket
+    MIGRATION_OK=0
+    if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+        info "Обнаружен ssh.socket (Ubuntu 24+), правлю systemd unit..."
+        mkdir -p /etc/systemd/system/ssh.socket.d
+        cat > /etc/systemd/system/ssh.socket.d/override.conf <<SOCKET_EOF
+[Socket]
+ListenStream=
+ListenStream=0.0.0.0:${SSH_PORT}
+ListenStream=[::]:${SSH_PORT}
+SOCKET_EOF
+        systemctl daemon-reload
+        if systemctl restart ssh.socket && systemctl restart ssh.service; then
+            MIGRATION_OK=1
+        fi
+    else
+        systemctl daemon-reload 2>/dev/null || true
+        if systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; then
+            MIGRATION_OK=1
+        fi
+    fi
+
+    if [[ $MIGRATION_OK -eq 1 ]]; then
+        sleep 5
+        if ss -tlnH 2>/dev/null | awk -v p="${SSH_PORT}" '{n=split($4,a,":"); if (a[n]==p) f=1} END{exit !f}'; then
+            success "SSH теперь слушает порт ${SSH_PORT}."
+            EFFECTIVE_SSH_PORT="$SSH_PORT"
+        else
+            MIGRATION_OK=0
+            warn "SSH перезапустился, но не слушает ${SSH_PORT}. Откатываю..."
+        fi
+    fi
+
+    if [[ $MIGRATION_OK -eq 0 ]]; then
+        warn "Миграция SSH не удалась. Откатываю на ${CURRENT_SSH_PORT}..."
+        mv "$SSHD_BACKUP" /etc/ssh/sshd_config
+        rm -f "$SSHPORT_CONF" 2>/dev/null
+        rm -rf /etc/systemd/system/ssh.socket.d 2>/dev/null
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl restart ssh.socket 2>/dev/null || true
+        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+        EFFECTIVE_SSH_PORT="$CURRENT_SSH_PORT"
+        step_fail "2/10 SSH-миграция (откат, продолжаю на порту ${CURRENT_SSH_PORT})"
+    fi
+else
+    success "SSH остаётся на порту ${CURRENT_SSH_PORT}."
+fi
+
+if [[ $NODE_EXISTS -eq 1 ]]; then
+    info "Режим обновления: существующие правила UFW (в т.ч. добавленные вручную) сохраняю."
+else
+    info "Сбрасываю старые правила UFW..."
+    ufw --force reset >/dev/null
+fi
+info "Default политики: deny incoming, allow outgoing..."
+ufw default deny incoming >/dev/null
+ufw default allow outgoing >/dev/null
+if [[ -f /etc/default/ufw ]] && grep -q "^IPV6=yes" /etc/default/ufw; then
+    sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw
+fi
+# По умолчанию открываем ТОЛЬКО SSH и порт ноды (порт ноды — для всех).
+# Клиентский порт 443 откроется позже, на этапе установки selfsteal/ноды.
+info "Открываю порты: SSH=${EFFECTIVE_SSH_PORT}/tcp, порт ноды=${NODE_PORT}/tcp (для всех)..."
+ufw allow "${EFFECTIVE_SSH_PORT}"/tcp comment 'ssh' >/dev/null
+ufw allow "${NODE_PORT}"/tcp comment 'app' >/dev/null
+info "Включаю UFW..."
+if echo "y" | ufw enable >/dev/null 2>&1; then
+    success "UFW активирован, SSH доступен на порту ${EFFECTIVE_SSH_PORT}."
+    step_ok "2/10 UFW config"
+else
+    step_fail "2/10 ufw enable"
+fi
+
+#===============================================================================
+# ШАГ 3/10 — Fail2Ban
+#===============================================================================
+step "Шаг 3/10: Fail2Ban"
+if ! command -v fail2ban-client >/dev/null 2>&1; then
+    info "Устанавливаю Fail2Ban..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y -qq fail2ban >/dev/null 2>&1 || true
+else
+    success "Fail2Ban уже установлен."
+fi
+if command -v fail2ban-client >/dev/null 2>&1; then
+    F2B_LOGPATH="/var/log/auth.log"
+    F2B_BACKEND="auto"
+    if [[ ! -f "$F2B_LOGPATH" ]] && command -v journalctl >/dev/null 2>&1; then
+        F2B_LOGPATH="SYSLOG"
+        F2B_BACKEND="systemd"
+    fi
+    info "Пишу /etc/fail2ban/jail.local (bantime=1ч, maxretry=5, findtime=600с, port=${EFFECTIVE_SSH_PORT})..."
+    tee /etc/fail2ban/jail.local >/dev/null <<JAIL
+[DEFAULT]
+bantime = 3600
+findtime = 600s
+maxretry = 5
+backend = $F2B_BACKEND
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled = true
+port = $EFFECTIVE_SSH_PORT
+filter = sshd
+logpath = $F2B_LOGPATH
+JAIL
+    systemctl enable fail2ban >/dev/null 2>&1 || true
+    systemctl restart fail2ban
+    sleep 1
+    if systemctl is-active --quiet fail2ban; then
+        success "Fail2Ban запущен, защищает порт ${EFFECTIVE_SSH_PORT}."
+        step_ok "3/10 Fail2Ban"
+    else
+        step_fail "3/10 fail2ban service не стартовал"
+    fi
+else
+    step_fail "3/10 fail2ban не установился"
+fi
+
+#===============================================================================
+# ШАГ 4/10 — Kernel Hardening
+#===============================================================================
+step "Шаг 4/10: Kernel Hardening"
+SYSCTL_HARDEN="$HARDEN_CONF"
+info "Пишу $SYSCTL_HARDEN..."
+tee "$SYSCTL_HARDEN" >/dev/null <<'SYSCTL_HARDEN_EOF'
+# network / kernel security tuning
+# --- SYN Flood Protection ---
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_synack_retries = 3
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_max_syn_backlog = 65535
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 32768
+
+# --- IP Spoofing & Network Attack Protection ---
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.log_martians = 1
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+# --- TCP Tuning ---
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 20
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_keepalive_intvl = 15
+
+# --- Kernel Security ---
+kernel.randomize_va_space = 2
+kernel.dmesg_restrict = 1
+kernel.yama.ptrace_scope = 1
+kernel.kptr_restrict = 2
+fs.protected_symlinks = 1
+fs.protected_hardlinks = 1
+fs.suid_dumpable = 0
+SYSCTL_HARDEN_EOF
+if sysctl -p "$SYSCTL_HARDEN" >/dev/null 2>&1; then
+    success "Kernel Hardening применён."
+    step_ok "4/10 Kernel Hardening"
+else
+    step_fail "4/10 sysctl -p hardening"
+fi
+
+#===============================================================================
+# ШАГ 5/10 — Сеть, производительность и лимиты
+#===============================================================================
+step "Шаг 5/10: Сеть, производительность и лимиты"
+
+# Congestion control: BBR. Родной для него qdisc — fq (cake намеренно НЕ берём:
+# он режет пиковую скорость ради справедливости между клиентами).
+modprobe tcp_bbr >/dev/null 2>&1 || true
+# hashsize задаём ДО загрузки модуля (иначе применится только после ребута).
+echo "nf_conntrack" > "/etc/modules-load.d/$(tok ct).conf"
+echo "options nf_conntrack hashsize=262144" > "/etc/modprobe.d/$(tok ct).conf"
+modprobe nf_conntrack >/dev/null 2>&1 || true
+
+info "Пишу $BOOST_CONF (BBR + fq, буферы 32M, лимиты соединений, conntrack)..."
+tee "$BOOST_CONF" >/dev/null <<EOF_NET
+# network performance & scale tuning
+# --- скорость / пропускная способность ---
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.tcp_rmem = 4096 87380 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
+
+# --- масштаб: тысячи одновременных клиентов ---
+fs.file-max = 2000000
+net.ipv4.ip_local_port_range = 10000 65535
+# Порты наших слушающих сервисов исключаем из эфемерного диапазона, чтобы
+# исходящие соединения случайно не заняли их (иначе конфликт).
+net.ipv4.ip_local_reserved_ports = ${EFFECTIVE_SSH_PORT},${NODE_PORT}
+net.ipv4.tcp_max_tw_buckets = 1440000
+
+# --- conntrack: не переполнять таблицу соединений при тысячах клиентов ---
+net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_tcp_timeout_established = 3600
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
+EOF_NET
+
+if sysctl -p "$BOOST_CONF" >/dev/null 2>&1; then
+    success "Сеть настроена (BBR + fq, буферы 32M, лимиты соединений)."
+    step_ok "5/10 Сеть и лимиты"
+else
+    warn "Часть параметров (conntrack) применится после перезагрузки — не критично."
+    step_ok "5/10 Сеть и лимиты (частично)"
+fi
+
+# LimitNOFILE для docker.service: без этого нода упрётся в лимит дескрипторов
+# под нагрузкой. Drop-in подхватится, когда Docker установят (на шаге ноды).
+mkdir -p /etc/systemd/system/docker.service.d
+cat > /etc/systemd/system/docker.service.d/override.conf <<'DOCKER_LIMIT_EOF'
+[Service]
+LimitNOFILE=1048576
+LimitNPROC=1048576
+DOCKER_LIMIT_EOF
+success "Лимит дескрипторов для Docker подготовлен (LimitNOFILE=1048576)."
+
+#===============================================================================
+# ШАГ 6/10 — Отключение IPv6
+#===============================================================================
+step "Шаг 6/10: Отключение IPv6"
+if ! ip -4 addr show scope global 2>/dev/null | grep -q "inet "; then
+    warn "У сервера нет глобального IPv4 — отключение IPv6 оборвёт доступ. Пропускаю."
+    step_fail "6/10 IPv6 (пропущено: сервер, похоже, IPv6-only)"
+else
+    tee "$IPV6_CONF" >/dev/null <<'EOF_NO6'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+EOF_NO6
+    if sysctl -p "$IPV6_CONF" >/dev/null 2>&1; then
+        success "IPv6 отключён."
+        step_ok "6/10 IPv6 off"
+    else
+        step_fail "6/10 sysctl -p ipv6"
+    fi
+fi
+
+#===============================================================================
+# ШАГ 7/10 — Firewall: анти-флуд + ICMP
+#===============================================================================
+step "Шаг 7/10: Firewall — анти-флуд + ICMP"
+BEFORE_RULES="/etc/ufw/before.rules"
+FLOOD_MARK="$(tok fw)"
+if [[ -f "$BEFORE_RULES" ]]; then
+    cp "$BEFORE_RULES" "${BEFORE_RULES}.bak.$(tok fwbak).$(date +%s)"
+
+    # 1) ICMP echo-request: rate-limit ВМЕСТО полного дропа. destination-unreachable
+    #    (в т.ч. fragmentation-needed для PMTUD), time-exceeded и parameter-problem
+    #    не трогаем — их блок ломает передачу крупных пакетов.
+    if grep -q -- '-A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT' "$BEFORE_RULES"; then
+        sed -i 's|-A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT|-A ufw-before-input -p icmp --icmp-type echo-request -m limit --limit 10/second --limit-burst 20 -j ACCEPT\n-A ufw-before-input -p icmp --icmp-type echo-request -j DROP|' "$BEFORE_RULES"
+    fi
+
+    # 2) Анти-флуд блок в ufw-before-input: дроп INVALID и битых TCP-флагов (сканы)
+    #    + per-IP лимит новых SYN на порт ноды. Идемпотентно (по маркеру).
+    command -v python3 >/dev/null 2>&1 || apt-get install -y -qq python3 >/dev/null 2>&1 || true
+    python3 - "$BEFORE_RULES" "$FLOOD_MARK" "$NODE_PORT" <<'PYEOF'
+import sys, re
+rules_file, mark, node_port = sys.argv[1], sys.argv[2], sys.argv[3]
+begin = "# %s-flood-begin" % mark
+end   = "# %s-flood-end" % mark
+with open(rules_file) as f:
+    content = f.read()
+content = re.sub(r'\n' + re.escape(begin) + r'.*?' + re.escape(end) + r'\n', '\n', content, flags=re.DOTALL)
+block = (
+    "\n" + begin + "\n"
+    "-A ufw-before-input -m conntrack --ctstate INVALID -j DROP\n"
+    "-A ufw-before-input -p tcp --tcp-flags ALL NONE -j DROP\n"
+    "-A ufw-before-input -p tcp --tcp-flags ALL ALL -j DROP\n"
+    "-A ufw-before-input -p tcp --tcp-flags FIN,SYN FIN,SYN -j DROP\n"
+    "-A ufw-before-input -p tcp --tcp-flags SYN,RST SYN,RST -j DROP\n"
+    "-A ufw-before-input -p tcp --dport " + node_port + " --syn -m hashlimit "
+    "--hashlimit-name synflood --hashlimit-mode srcip --hashlimit-above 30/sec "
+    "--hashlimit-burst 60 -j DROP\n"
+    + end + "\n"
+)
+i = content.rfind("COMMIT")
+content = content[:i] + block + content[i:] if i != -1 else content + block
+with open(rules_file, "w") as f:
+    f.write(content)
+print("OK")
+PYEOF
+
+    ufw reload >/dev/null 2>&1 || true
+    success "Анти-флуд активен: дроп INVALID/битых флагов, лимит SYN на порт ноды, ICMP rate-limit."
+    step_ok "7/10 Firewall анти-флуд"
+else
+    warn "$BEFORE_RULES не найден — пропуск."
+    step_fail "7/10 before.rules не найден"
+fi
+
+#===============================================================================
+# ШАГ 8/10 — Авто-обновления безопасности + системные журналы
+#===============================================================================
+step "Шаг 8/10: Авто-обновления безопасности + журналы"
+
+# Авто-обновления: ставим ТОЛЬКО security-патчи, без авто-перезагрузки.
+info "Настраиваю автоматические обновления безопасности..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get install -y -qq unattended-upgrades >/dev/null 2>&1 || true
+if [[ -d /etc/apt/apt.conf.d ]]; then
+    cat > /etc/apt/apt.conf.d/20auto-upgrades <<'AU_EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+AU_EOF
+    cat > /etc/apt/apt.conf.d/52-unattended-local <<'AU_EOF2'
+Unattended-Upgrade::Automatic-Reboot "false";
+AU_EOF2
+    success "Авто-обновления безопасности включены (без авто-ребута)."
+else
+    warn "Каталог /etc/apt/apt.conf.d не найден — пропуск авто-обновлений."
+fi
+
+# journald persistent: журналы переживают перезагрузку (нужно для разбора
+# инцидентов), с лимитом размера чтобы не переполнить диск.
+info "Включаю постоянное хранение системных журналов..."
+mkdir -p /etc/systemd/journald.conf.d /var/log/journal
+cat > "/etc/systemd/journald.conf.d/$(tok journal).conf" <<'JRN_EOF'
+[Journal]
+Storage=persistent
+SystemMaxUse=500M
+JRN_EOF
+systemctl restart systemd-journald 2>/dev/null || true
+success "journald: постоянное хранение включено (лимит 500M)."
+
+step_ok "8/10 Авто-обновления + журналы"
+
+#===============================================================================
+# ШАГ 9/10 — Установка Remnanode
+#===============================================================================
+step "Шаг 9/10: Установка Remnanode"
+if [[ $NODE_EXISTS -eq 1 ]]; then
+    warn "Нода уже установлена (${NODE_EVIDENCE}) — установку пропускаю, второй экземпляр не ставлю."
+    SETUP_DONE+=("9/10 Remnanode (уже установлена — пропущено)")
+else
+    node_ok=1
+    while :; do
+        # 1) Docker (официальный установщик get.docker.com)
+        if ! command -v docker >/dev/null 2>&1; then
+            info "Устанавливаю Docker (get.docker.com, может занять пару минут)..."
+            curl -fsSL https://get.docker.com -o /tmp/_getdocker.sh 2>/dev/null && sh /tmp/_getdocker.sh >/dev/null 2>&1
+            rm -f /tmp/_getdocker.sh
+        fi
+        if ! command -v docker >/dev/null 2>&1; then
+            warn "Docker не установился."; node_ok=0; break
+        fi
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable --now docker >/dev/null 2>&1 || true
+        systemctl restart docker >/dev/null 2>&1 || true   # применить LimitNOFILE drop-in (шаг 5)
+        if ! docker info >/dev/null 2>&1; then
+            warn "Docker установлен, но демон не запущен."; node_ok=0; break
+        fi
+        success "Docker готов."
+
+        # 2) docker-compose.yml (официальный формат + наши лимиты логов)
+        info "Создаю /opt/remnanode/docker-compose.yml (образ remnawave/node:${NODE_VERSION})..."
+        mkdir -p /opt/remnanode
+        cat > /opt/remnanode/docker-compose.yml <<EOF
+services:
+  remnanode:
+    image: remnawave/node:${NODE_VERSION}
+    container_name: remnanode
+    hostname: remnanode
+    network_mode: host
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    logging:
+      driver: json-file
+      options:
+        max-size: "30m"
+        max-file: "5"
+    environment:
+      - NODE_PORT=${NODE_PORT}
+      - SECRET_KEY="${SECRET_KEY}"
+EOF
+        chmod 0600 /opt/remnanode/docker-compose.yml
+
+        # 3) Поднять контейнер и дождаться запуска
+        info "Поднимаю контейнер ноды..."
+        ( cd /opt/remnanode && docker compose up -d ) >/dev/null 2>&1 || true
+        _w=0
+        while [[ $_w -lt 120 ]]; do
+            docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$' && break
+            sleep 3; _w=$((_w + 3))
+        done
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
+            node_ok=1
+        else
+            warn "Контейнер remnanode не поднялся за ${_w}с (логи: cd /opt/remnanode && docker compose logs)."
+            node_ok=0
+        fi
+        break
+    done
+    if [[ $node_ok -eq 1 ]]; then
+        success "Нода remnanode запущена (remnawave/node:${NODE_VERSION}, порт ${NODE_PORT})."
+        step_ok "9/10 Remnanode"
+    else
+        step_fail "9/10 Remnanode (не установилась — см. сообщения выше)"
+    fi
+fi
+
+#===============================================================================
+# ШАГ 10/10 — Docker + UFW Professional Fix (авто)
+#===============================================================================
+# Docker по умолчанию пишет правила напрямую в iptables в обход UFW, из-за чего
+# опубликованные порты контейнеров открыты, даже если UFW стоит на DENY. Этот
+# фикс направляет трафик контейнеров через DOCKER-USER → ufw-user-forward.
+step "Шаг 10/10: Docker + UFW Fix"
+apply_docker_ufw_fix() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        info "Устанавливаю python3 (нужен для правки after.rules)..."
+        apt-get install -y -qq python3 >/dev/null 2>&1 || true
+    fi
+
+    # 1. Разрешаем Docker-подсети
+    ufw allow from 172.16.0.0/12 comment 'Docker networks' >/dev/null 2>&1 || true
+    ufw allow from 192.168.0.0/16 comment 'Docker bridge' >/dev/null 2>&1 || true
+
+    local after_rules="/etc/ufw/after.rules"
+    local marker_start="# ${DOCKER_MARK}-begin"
+    local marker_end="# ${DOCKER_MARK}-end"
+    if [[ ! -f "$after_rules" ]]; then
+        warn "$after_rules не найден — пропускаю Docker UFW Fix."
+        return 1
+    fi
+
+    local iface
+    iface=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5}' | head -1)
+    iface=${iface:-eth0}
+
+    # Если блок уже есть — удаляем старую версию перед вставкой свежей
+    if grep -q "$marker_start" "$after_rules"; then
+        info "Обновляю существующий блок Docker UFW Fix..."
+        python3 - <<PYEOF
+import re
+with open('${after_rules}', 'r') as f:
+    content = f.read()
+content = re.sub(r'\n${marker_start}.*?${marker_end}\n', '', content, flags=re.DOTALL)
+with open('${after_rules}', 'w') as f:
+    f.write(content)
+PYEOF
+    fi
+
+    # Дописываем блок ОТДЕЛЬНОЙ секцией *filter ... COMMIT в конец файла.
+    # Почему так: ufw-init грузит файлы в порядке before.rules → after.rules → user.rules,
+    # а свои цепочки ufw-user-* создаёт только ПОСЛЕ after.rules. Если сослаться на
+    # ufw-user-forward, не объявив её, `ufw enable` после `ufw disable` падает с
+    # "Chain 'ufw-user-forward' does not exist". Объявление `:ufw-user-forward - [0:0]`
+    # при restore с -n безопасно: существующая цепочка не сбрасывается (как в ufw-docker).
+    python3 - "$after_rules" "$marker_start" "$marker_end" "$iface" <<'PYEOF'
+import sys
+rules_file, marker_s, marker_e, iface = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+with open(rules_file, 'r') as f:
+    content = f.read()
+
+docker_block = f"""
+{marker_s}
+# Эти правила заставляют Docker-трафик проходить через фильтрацию UFW.
+# Отдельная секция *filter: ufw создаёт ufw-user-forward уже после after.rules,
+# поэтому цепочку объявляем сами (с -n существующая цепочка не сбрасывается).
+*filter
+:ufw-user-forward - [0:0]
+:DOCKER-USER - [0:0]
+-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+-A DOCKER-USER -i {iface} -p udp -m udp --sport 53 --dport 1024:65535 -j RETURN
+-A DOCKER-USER -i {iface} -j ufw-user-forward
+-A DOCKER-USER -i {iface} -j DROP
+-A DOCKER-USER -j RETURN
+COMMIT
+{marker_e}
+"""
+
+content = content.rstrip('\n') + '\n' + docker_block
+with open(rules_file, 'w') as f:
+    f.write(content)
+print('OK')
+PYEOF
+    local rc=$?
+    if [[ $rc -ne 0 ]]; then
+        warn "Не удалось вставить блок в after.rules."
+        return 1
+    fi
+    success "Блок Docker UFW Fix добавлен в ${after_rules} (интерфейс: ${iface})."
+
+    # Синхронизируем route-правила только если Docker уже установлен
+    if command -v docker >/dev/null 2>&1; then
+        info "Синхронизирую порты Docker-контейнеров с UFW route..."
+        local docker_ports ufw_in_ports p
+        docker_ports=$(docker ps --format "{{.Ports}}" 2>/dev/null | grep -oE '0.0.0.0:[0-9]+' | cut -d: -f2 | sort -u)
+        ufw_in_ports=$(ufw status | grep "ALLOW" | grep -v "(v6)" | awk '{print $1}' | grep -oE '^[0-9]+' | sort -u)
+        for p in $ufw_in_ports; do
+            if echo "$docker_ports" | grep -qx "$p"; then
+                ufw route allow "$p" >/dev/null 2>&1 || true
+            else
+                ufw route delete allow "$p" >/dev/null 2>&1 || true
+            fi
+        done
+    else
+        info "Docker ещё не установлен — правила after.rules готовы, порты синхронизируются после установки ноды."
+    fi
+    local reload_out
+    if reload_out=$(ufw reload 2>&1); then
+        return 0
+    else
+        warn "ufw reload завершился с ошибкой, блок Docker UFW Fix мог не примениться:"
+        echo "$reload_out" | sed 's/^/    /'
+        return 1
+    fi
+}
+
+if apply_docker_ufw_fix; then
+    success "Docker + UFW Fix применён."
+    step_ok "10/10 Docker UFW Fix"
+else
+    step_fail "10/10 Docker UFW Fix"
+fi
+
+#===============================================================================
+# Установка команды управления nodectl
+#===============================================================================
+step "Установка команды управления nodectl..."
+install_nodectl
 SETUP_DONE+=("nodectl установлен")
 success "Команда nodectl установлена (наберите: nodectl)"
 
