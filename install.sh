@@ -199,17 +199,18 @@ else
 fi
 
 # Версия образа ноды. У remnawave/node нет «скользящего» тега 2 — фиксируем
-# конкретную 2.8.0 (последняя в ветке 2.x) либо latest (свежая, ветка 3.x).
-NODE_VERSION="2.8.0"
+# latest (ветка 3.x, для панели 3+) либо конкретную 2.8.0 (последняя в ветке 2.x,
+# для панели до версии 3). Выбор зависит от версии панели, а не от «стабильности».
+NODE_VERSION="latest"
 if [[ $NODE_EXISTS -eq 0 ]]; then
     echo ""
-    info "Версия ноды:"
-    info "  1) 2.8.0  — стабильная, последняя в ветке 2.x (рекомендуется)"
-    info "  2) latest — самая свежая (ветка 3.x, может требовать более новую панель)"
+    info "Версия ноды (должна соответствовать версии панели Remnawave):"
+    info "  1) latest — для новой панели версии 3 и выше"
+    info "  2) 2.8.0  — для панели версии до 3 (ветка 2.x)"
     _vchoice=$(ask "Выберите версию (1/2)" "1")
     case "$_vchoice" in
-        2|latest|l|L) NODE_VERSION="latest" ;;
-        *)            NODE_VERSION="2.8.0" ;;
+        2|2.8|2.8.0) NODE_VERSION="2.8.0" ;;
+        *)           NODE_VERSION="latest" ;;
     esac
     success "Версия ноды: ${NODE_VERSION}"
 fi
@@ -763,7 +764,12 @@ with open('${after_rules}', 'w') as f:
 PYEOF
     fi
 
-    # Вставляем блок перед последним COMMIT
+    # Дописываем блок ОТДЕЛЬНОЙ секцией *filter ... COMMIT в конец файла.
+    # Почему так: ufw-init грузит файлы в порядке before.rules → after.rules → user.rules,
+    # а свои цепочки ufw-user-* создаёт только ПОСЛЕ after.rules. Если сослаться на
+    # ufw-user-forward, не объявив её, `ufw enable` после `ufw disable` падает с
+    # "Chain 'ufw-user-forward' does not exist". Объявление `:ufw-user-forward - [0:0]`
+    # при restore с -n безопасно: существующая цепочка не сбрасывается (как в ufw-docker).
     python3 - "$after_rules" "$marker_start" "$marker_end" "$iface" <<'PYEOF'
 import sys
 rules_file, marker_s, marker_e, iface = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
@@ -773,21 +779,21 @@ with open(rules_file, 'r') as f:
 docker_block = f"""
 {marker_s}
 # Эти правила заставляют Docker-трафик проходить через фильтрацию UFW.
+# Отдельная секция *filter: ufw создаёт ufw-user-forward уже после after.rules,
+# поэтому цепочку объявляем сами (с -n существующая цепочка не сбрасывается).
+*filter
+:ufw-user-forward - [0:0]
 :DOCKER-USER - [0:0]
 -A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
 -A DOCKER-USER -i {iface} -p udp -m udp --sport 53 --dport 1024:65535 -j RETURN
 -A DOCKER-USER -i {iface} -j ufw-user-forward
 -A DOCKER-USER -i {iface} -j DROP
 -A DOCKER-USER -j RETURN
+COMMIT
 {marker_e}
 """
 
-if 'COMMIT' in content:
-    idx = content.rfind('COMMIT')
-    content = content[:idx] + docker_block + content[idx:]
-else:
-    content += docker_block
-
+content = content.rstrip('\n') + '\n' + docker_block
 with open(rules_file, 'w') as f:
     f.write(content)
 print('OK')
@@ -815,8 +821,14 @@ PYEOF
     else
         info "Docker ещё не установлен — правила after.rules готовы, порты синхронизируются после установки ноды."
     fi
-    ufw reload >/dev/null 2>&1 || true
-    return 0
+    local reload_out
+    if reload_out=$(ufw reload 2>&1); then
+        return 0
+    else
+        warn "ufw reload завершился с ошибкой, блок Docker UFW Fix мог не примениться:"
+        echo "$reload_out" | sed 's/^/    /'
+        return 1
+    fi
 }
 
 if apply_docker_ufw_fix; then
@@ -1680,7 +1692,8 @@ nodectl — управление нодой и безопасностью
   nodectl status       показать статус
   nodectl restart      перезапустить ноду
   nodectl update       обновить ноду (до тега из docker-compose.yml)
-  nodectl update-self  обновить сам скрипт nodectl из GitHub
+  nodectl update-self  обновить сам nodectl и закалку (повторный запуск install.sh из GitHub)
+Все команды доступны и как пункты меню.
 U
 }
 
@@ -1721,8 +1734,13 @@ main_menu() {
         echo ""
         echo -e "${GR}──── 🖥️  Нода ────${N}"
         echo -e "  9) 🧬 Xray-core (своя версия / дефолт)   ${xray_b}"
+        echo -e "  r) 🔄 Перезапустить ноду"
+        echo -e "  n) ⬆️  Обновить ноду (образ, тег из docker-compose.yml)"
         echo -e "  u) 🗑️  Удалить ноду (полностью)"
-        echo -e "${GR}     ещё: nodectl restart · nodectl update · nodectl update-self${N}"
+        echo ""
+        echo -e "${GR}──── 🧰 Скрипт ────${N}"
+        echo -e "  i) 📊 Статус сервера"
+        echo -e "  s) ⬇️  Обновить nodectl и закалку (install.sh из GitHub)"
         echo ""
         echo "  0) Выход"
         read -rp "$PROMPT" ch || exit 0
@@ -1736,7 +1754,13 @@ main_menu() {
             7) menu_psiphon ;;
             8) menu_selfsteal ;;
             9) menu_xray ;;
+            r|R) node_restart; pause ;;
+            n|N) node_update; pause ;;
             u|U) node_uninstall; pause ;;
+            i|I) show_status; pause ;;
+            s|S) node_selfupdate; pause
+                 # После обновления перезапускаем уже новую версию nodectl.
+                 exec /usr/local/bin/nodectl ;;
             0|q) exit 0 ;;
             *) echo -e "${Y}Неверный выбор.${N}"; sleep 1 ;;
         esac
