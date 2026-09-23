@@ -143,6 +143,13 @@ SYN_SYSCTL="/etc/sysctl.d/99-$(tok synp).conf"
 XRAY_BIN="/opt/remnanode/xray"
 XRAY_MARK="$(tok xray)"
 NODE_COMPOSE="/opt/remnanode/docker-compose.yml"
+VOL_MARK="$(tok vol)"
+
+# Логи ноды в файлах: Xray пишет access.log/error.log в /var/log/remnanode (путь задаёт
+# конфиг панели), каталог монтируется в контейнер, ротацию делает logrotate.
+LOG_DIR="/var/log/remnanode"
+LOG_MOUNT="${LOG_DIR}:${LOG_DIR}"
+LOGROTATE_CONF="/etc/logrotate.d/remnanode"
 
 need_root() { [[ $EUID -eq 0 ]] || { echo -e "${R}Запустите от root (sudo nodectl).${N}"; exit 1; }; }
 pause() { echo ""; read -rp "$(echo -e "${GR}Enter — назад...${N}")" _ || true; }
@@ -746,30 +753,134 @@ _xray_arch() {
     esac
 }
 _xray_cver() { docker exec remnanode xray version 2>/dev/null | head -1 | awk '{print $2}'; }
-_xray_custom_on() { grep -q "${XRAY_MARK}-xraybegin" "$NODE_COMPOSE" 2>/dev/null; }
-
-_xray_add_mount() {
-    python3 - "$NODE_COMPOSE" "$XRAY_MARK" "$XRAY_BIN" <<'PY'
+# Единый блок volumes в docker-compose.yml (маркер ${VOL_MARK}): пункты добавляются и убираются
+# по одному, старый блок xray (xraybegin/xrayend) переносится в него автоматически.
+# Два ключа volumes: в одном сервисе — невалидный YAML, поэтому блок один на всех.
+_compose_mount() {   # add|del "<host>:<container>"
+    python3 - "$NODE_COMPOSE" "$VOL_MARK" "$1" "$2" <<'PY'
 import sys, re
-f, mark, binpath = sys.argv[1], sys.argv[2], sys.argv[3]
-b="    # %s-xraybegin"%mark; e="    # %s-xrayend"%mark
-c=open(f).read()
-c=re.sub(r'\n'+re.escape(b)+r'.*?'+re.escape(e)+r'\n','\n',c,flags=re.DOTALL)
-block="%s\n    volumes:\n      - %s:/usr/local/bin/xray\n%s\n"%(b, binpath, e)
-m=re.search(r'^    environment:', c, re.M)
-c = c[:m.start()]+block+c[m.start():] if m else c.rstrip()+"\n"+block
-open(f,'w').write(c); print("OK")
+f, mark, action, item = sys.argv[1:5]
+b = "    # %s-volbegin" % mark; e = "    # %s-volend" % mark
+c = open(f).read()
+items = []
+legacy = re.search(r'\n    # (\S+)-xraybegin\n(.*?)\n    # \1-xrayend\n', c, re.DOTALL)
+if legacy:
+    items += [l.strip()[2:].strip() for l in legacy.group(2).splitlines() if l.strip().startswith('- ')]
+    c = c[:legacy.start()] + "\n" + c[legacy.end():]
+m = re.search(r'\n' + re.escape(b) + r'\n(.*?)\n' + re.escape(e) + r'\n', c, re.DOTALL)
+if m:
+    items += [l.strip()[2:].strip() for l in m.group(1).splitlines() if l.strip().startswith('- ')]
+    c = c[:m.start()] + "\n" + c[m.end():]
+items = [i for i in items if i != item]
+if action == 'add':
+    items.append(item)
+if items:
+    block = "%s\n    volumes:\n%s\n%s\n" % (b, "\n".join("      - " + i for i in items), e)
+    mm = re.search(r'^    environment:', c, re.M)
+    c = c[:mm.start()] + block + c[mm.start():] if mm else c.rstrip() + "\n" + block
+open(f, 'w').write(c); print("OK")
 PY
 }
-_xray_del_mount() {
-    python3 - "$NODE_COMPOSE" "$XRAY_MARK" <<'PY'
-import sys, re
-f, mark = sys.argv[1], sys.argv[2]
-b="    # %s-xraybegin"%mark; e="    # %s-xrayend"%mark
-c=open(f).read()
-c=re.sub(r'\n'+re.escape(b)+r'.*?'+re.escape(e)+r'\n','\n',c,flags=re.DOTALL)
-open(f,'w').write(c); print("OK")
-PY
+
+_xray_custom_on() { grep -q -- "- ${XRAY_BIN}:/usr/local/bin/xray" "$NODE_COMPOSE" 2>/dev/null; }
+_xray_add_mount() { _compose_mount add "${XRAY_BIN}:/usr/local/bin/xray"; }
+_xray_del_mount() { _compose_mount del "${XRAY_BIN}:/usr/local/bin/xray"; }
+
+#-------------------------------------------------------------------------------
+# Логи ноды в файлах (/var/log/remnanode) + ротация logrotate
+#-------------------------------------------------------------------------------
+_logs_on() { grep -q -- "- ${LOG_MOUNT}" "$NODE_COMPOSE" 2>/dev/null; }
+
+_logs_write_rotate() {
+    if ! command -v logrotate >/dev/null 2>&1; then
+        echo -e "${C}Устанавливаю logrotate...${N}"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq logrotate >/dev/null 2>&1 || return 1
+    fi
+    # copytruncate: Xray держит файл открытым, переименовывать его нельзя — обрезаем на месте.
+    cat > "$LOGROTATE_CONF" <<ROT
+${LOG_DIR}/*.log {
+    size 50M
+    rotate 5
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+ROT
+    chmod 0644 "$LOGROTATE_CONF"
+    logrotate -d "$LOGROTATE_CONF" >/dev/null 2>&1
+}
+
+node_logs_enable() {
+    [[ -f "$NODE_COMPOSE" ]] || { echo -e "${R}Нода не установлена.${N}"; return 1; }
+    mkdir -p "$LOG_DIR" && chmod 0755 "$LOG_DIR"
+    local changed=0
+    if _logs_on; then
+        echo -e "${G}✓${N} Каталог ${LOG_DIR} уже монтируется в контейнер."
+    else
+        cp "$NODE_COMPOSE" "${NODE_COMPOSE}.bak.$(date +%s)"
+        _compose_mount add "$LOG_MOUNT" >/dev/null || { echo -e "${R}Не удалось изменить docker-compose.yml.${N}"; return 1; }
+        echo -e "${G}✓${N} В docker-compose.yml добавлен том ${LOG_MOUNT}."
+        changed=1
+    fi
+    if _logs_write_rotate; then
+        echo -e "${G}✓${N} Ротация: ${LOGROTATE_CONF} (50 МБ × 5 архивов, сжатие)."
+    else
+        echo -e "${Y}⚠${N} logrotate не установился — логи будут расти без ротации."
+    fi
+    if [[ $changed -eq 1 ]]; then
+        echo -e "${C}Пересоздаю контейнер ноды, чтобы подхватил том...${N}"
+        if ( cd /opt/remnanode && docker compose up -d --force-recreate ) >/dev/null 2>&1; then
+            echo -e "${G}✓${N} Нода перезапущена."
+        else
+            echo -e "${R}Не удалось пересоздать контейнер (см. cd /opt/remnanode && docker compose logs).${N}"; return 1
+        fi
+    fi
+    echo -e "${G}Готово.${N} Логи: ${C}${LOG_DIR}/access.log${N} и ${C}${LOG_DIR}/error.log${N}"
+    echo -e "${GR}Пути задаёт конфиг Xray в панели (log.access / log.error) — по умолчанию именно эти.${N}"
+}
+
+node_logs_disable() {
+    [[ -f "$NODE_COMPOSE" ]] || { echo -e "${R}Нода не установлена.${N}"; return 1; }
+    _logs_on || { echo -e "${GR}Логи и так внутри контейнера.${N}"; return 0; }
+    cp "$NODE_COMPOSE" "${NODE_COMPOSE}.bak.$(date +%s)"
+    _compose_mount del "$LOG_MOUNT" >/dev/null || { echo -e "${R}Не удалось изменить docker-compose.yml.${N}"; return 1; }
+    rm -f "$LOGROTATE_CONF"
+    ( cd /opt/remnanode && docker compose up -d --force-recreate ) >/dev/null 2>&1 || true
+    echo -e "${G}✓${N} Том отключён, ротация снята. Файлы в ${LOG_DIR} не тронуты."
+}
+
+node_logs_tail() {   # access|error [строк]
+    local f="${LOG_DIR}/${1:-access}.log" n="${2:-50}"
+    [[ -f "$f" ]] || { echo -e "${Y}Файла ${f} ещё нет: нода не писала в него (проверьте пути логов в конфиге панели).${N}"; return 1; }
+    echo -e "${C}${f} — последние ${n} строк (размер $(du -h "$f" | cut -f1)):${N}"
+    tail -n "$n" "$f"
+}
+
+menu_node_logs() {
+    local a st sz
+    while true; do
+        hdr "Логи ноды — файлы и ротация"
+        if _logs_on; then st="${G}✅ в файлах ${LOG_DIR}${N}"; else st="${GR}⚪ внутри контейнера (docker logs)${N}"; fi
+        sz=$(du -sh "$LOG_DIR" 2>/dev/null | cut -f1)
+        echo -e "  Сейчас: ${st}"
+        [[ -n "$sz" ]] && echo -e "  Занято: ${C}${sz}${N}   ротация: $([[ -f "$LOGROTATE_CONF" ]] && echo -e "${G}настроена${N}" || echo -e "${GR}нет${N}")"
+        echo ""
+        echo "  1) Включить: писать в файлы + ротация (50 МБ × 5)"
+        echo "  2) Показать хвост access.log"
+        echo "  3) Показать хвост error.log"
+        echo "  4) Выключить (вернуть логи в контейнер)"
+        echo "  0) Назад"
+        read -rp "$PROMPT" a || return
+        case "${a:-}" in
+            1) echo ""; node_logs_enable; pause ;;
+            2) echo ""; node_logs_tail access 60; pause ;;
+            3) echo ""; node_logs_tail error 60; pause ;;
+            4) echo ""; node_logs_disable; pause ;;
+            0) return ;;
+        esac
+    done
 }
 
 xray_status() {
@@ -970,6 +1081,8 @@ nodectl — управление нодой и безопасностью
   nodectl status       показать статус
   nodectl restart      перезапустить ноду
   nodectl update       обновить ноду (до тега из docker-compose.yml)
+  nodectl logs [access|error] [N]   хвост логов ноды из /var/log/remnanode (если включены)
+  nodectl logs-enable  вывести логи ноды в файлы + ротация (то же, что пункт «l» меню)
   nodectl update-self  обновить только сам nodectl из GitHub (закалка и UFW не трогаются)
 Все команды доступны и как пункты меню.
 Полная закалка заново: bash <(curl -sL $SELF_URL)
@@ -977,7 +1090,7 @@ U
 }
 
 main_menu() {
-    local psi_c ss_c ch geo_b ipv6_b icmp_b psi_b ss_b xray_b
+    local psi_c ss_c ch geo_b ipv6_b icmp_b psi_b ss_b xray_b logs_b
     while true; do
         clear
         # Psiphon / Selfsteal: цвет пункта + метка справа.
@@ -993,6 +1106,10 @@ main_menu() {
         if [[ ! -f "$NODE_COMPOSE" ]]; then xray_b="${GR}(нет ноды)${N}"
         elif _xray_custom_on; then xray_b="${Y}(вручную)${N}"
         else xray_b="${G}(из образа)${N}"; fi
+        # Логи ноды: файлы с ротацией / внутри контейнера.
+        if [[ ! -f "$NODE_COMPOSE" ]]; then logs_b="${GR}(нет ноды)${N}"
+        elif _logs_on; then logs_b="${G}✅ файлы + ротация${N}"
+        else logs_b="${GR}⚪ в контейнере${N}"; fi
 
         echo ""
         echo -e "  ${C}N O D E C T L${N}"
@@ -1013,6 +1130,7 @@ main_menu() {
         echo ""
         echo -e "${GR}──── 🖥️  Нода ────${N}"
         echo -e "  9) 🧬 Xray-core (своя версия / дефолт)   ${xray_b}"
+        echo -e "  l) 📝 Логи ноды (файлы + ротация)   ${logs_b}"
         echo -e "  r) 🔄 Перезапустить ноду"
         echo -e "  n) ⬆️  Обновить ноду (образ, тег из docker-compose.yml)"
         echo -e "  u) 🗑️  Удалить ноду (полностью)"
@@ -1033,6 +1151,7 @@ main_menu() {
             7) menu_psiphon ;;
             8) menu_selfsteal ;;
             9) menu_xray ;;
+            l|L) menu_node_logs ;;
             r|R) node_restart; pause ;;
             n|N) node_update; pause ;;
             u|U) node_uninstall; pause ;;
@@ -1050,6 +1169,8 @@ case "$cmd" in
     menu|"")     need_root; main_menu ;;
     restart)     need_root; node_restart ;;
     update)      need_root; node_update ;;
+    logs)        need_root; node_logs_tail "${2:-access}" "${3:-50}" ;;
+    logs-enable) need_root; node_logs_enable ;;
     update-self) need_root; node_selfupdate ;;
     geo-reapply) need_root; geo_reapply ;;
     -h|--help)   usage ;;
@@ -1099,6 +1220,63 @@ HARDEN_CONF="/etc/sysctl.d/99-$(tok harden).conf"
 BOOST_CONF="/etc/sysctl.d/99-$(tok boost).conf"
 IPV6_CONF="/etc/sysctl.d/98-$(tok ipv6).conf"
 DOCKER_MARK="$(tok dmark)"
+
+# --- Логи ноды в файлах: том в docker-compose.yml + logrotate. Идемпотентно; та же логика,
+#     что в nodectl (пункт «l»). Контейнер пересоздаётся только если том действительно добавлен.
+install_node_logs() {
+    local compose="/opt/remnanode/docker-compose.yml" dir="/var/log/remnanode" mark changed=0
+    mark="$(tok vol)"
+    mkdir -p "$dir" && chmod 0755 "$dir"
+    if ! grep -q -- "- ${dir}:${dir}" "$compose" 2>/dev/null; then
+        cp "$compose" "${compose}.bak.$(date +%s)"
+        command -v python3 >/dev/null 2>&1 || apt-get install -y -qq python3 >/dev/null 2>&1 || true
+        python3 - "$compose" "$mark" "${dir}:${dir}" <<'PY' || { warn "Не удалось изменить docker-compose.yml."; return 1; }
+import sys, re
+f, mark, item = sys.argv[1:4]
+b = "    # %s-volbegin" % mark; e = "    # %s-volend" % mark
+c = open(f).read()
+items = []
+legacy = re.search(r'\n    # (\S+)-xraybegin\n(.*?)\n    # \1-xrayend\n', c, re.DOTALL)
+if legacy:
+    items += [l.strip()[2:].strip() for l in legacy.group(2).splitlines() if l.strip().startswith('- ')]
+    c = c[:legacy.start()] + "\n" + c[legacy.end():]
+m = re.search(r'\n' + re.escape(b) + r'\n(.*?)\n' + re.escape(e) + r'\n', c, re.DOTALL)
+if m:
+    items += [l.strip()[2:].strip() for l in m.group(1).splitlines() if l.strip().startswith('- ')]
+    c = c[:m.start()] + "\n" + c[m.end():]
+items = [i for i in items if i != item] + [item]
+block = "%s\n    volumes:\n%s\n%s\n" % (b, "\n".join("      - " + i for i in items), e)
+mm = re.search(r'^    environment:', c, re.M)
+c = c[:mm.start()] + block + c[mm.start():] if mm else c.rstrip() + "\n" + block
+open(f, 'w').write(c)
+PY
+        changed=1
+        info "В docker-compose.yml добавлен том ${dir}:${dir}."
+    fi
+    if ! command -v logrotate >/dev/null 2>&1; then
+        info "Устанавливаю logrotate..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq logrotate >/dev/null 2>&1 || { warn "logrotate не установился."; return 1; }
+    fi
+    # copytruncate: Xray держит файл открытым, переименовывать его нельзя — обрезаем на месте.
+    cat > /etc/logrotate.d/remnanode <<'ROT'
+/var/log/remnanode/*.log {
+    size 50M
+    rotate 5
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+ROT
+    chmod 0644 /etc/logrotate.d/remnanode
+    logrotate -d /etc/logrotate.d/remnanode >/dev/null 2>&1 || { warn "Конфиг logrotate не прошёл проверку."; return 1; }
+    if [[ $changed -eq 1 ]] && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
+        info "Пересоздаю контейнер ноды, чтобы подхватил том..."
+        ( cd /opt/remnanode && docker compose up -d --force-recreate ) >/dev/null 2>&1 || { warn "Контейнер не пересоздался (cd /opt/remnanode && docker compose logs)."; return 1; }
+    fi
+    return 0
+}
 
 # --- Режим «только обновить nodectl» (его вызывает `nodectl update-self`) ---
 # Закалку, UFW, fail2ban и ноду не трогает: переустанавливает лишь команду nodectl.
@@ -1196,6 +1374,17 @@ if [[ $NODE_EXISTS -eq 0 ]]; then
     success "Версия ноды: ${NODE_VERSION}"
 fi
 
+# --- Логи ноды: файлы на сервере + ротация (по умолчанию да) ---
+NODE_LOGS=1
+if grep -q -- '- /var/log/remnanode:/var/log/remnanode' /opt/remnanode/docker-compose.yml 2>/dev/null; then
+    info "Логи ноды уже выводятся в файлы /var/log/remnanode — ротация будет проверена."
+else
+    echo ""
+    info "Логи Xray (access.log, error.log) можно писать в файлы на сервере: ${CYAN}/var/log/remnanode${RESET}"
+    info "с ротацией logrotate (50 МБ × 5 архивов). Иначе они остаются только внутри контейнера."
+    if confirm "Выводить логи ноды в файлы с ротацией?" "y"; then NODE_LOGS=1; else NODE_LOGS=0; fi
+fi
+
 # --- Сводка + подтверждение ---
 echo ""
 echo -e "${YELLOW}========================================${RESET}"
@@ -1211,6 +1400,11 @@ fi
 echo -e "  Порт ноды:       ${CYAN}${NODE_PORT}${RESET}"
 if [[ $NODE_EXISTS -eq 0 ]]; then
     echo -e "  Версия ноды:     ${CYAN}${NODE_VERSION}${RESET}"
+fi
+if [[ $NODE_LOGS -eq 1 ]]; then
+    echo -e "  Логи ноды:       ${CYAN}/var/log/remnanode${RESET} ${GRAY}+ ротация 50 МБ × 5${RESET}"
+else
+    echo -e "  Логи ноды:       ${GRAY}внутри контейнера (docker logs)${RESET}"
 fi
 echo -e "${YELLOW}========================================${RESET}"
 echo ""
@@ -1658,6 +1852,11 @@ else
         # 2) docker-compose.yml (официальный формат + наши лимиты логов)
         info "Создаю /opt/remnanode/docker-compose.yml (образ remnawave/node:${NODE_VERSION})..."
         mkdir -p /opt/remnanode
+        # Том логов — тем же маркированным блоком, которым потом управляет nodectl (пункт «l»).
+        LOGS_VOLUME_BLOCK=""
+        if [[ $NODE_LOGS -eq 1 ]]; then
+            LOGS_VOLUME_BLOCK=$(printf '    # %s-volbegin\n    volumes:\n      - /var/log/remnanode:/var/log/remnanode\n    # %s-volend\n' "$(tok vol)" "$(tok vol)")$'\n'
+        fi
         cat > /opt/remnanode/docker-compose.yml <<EOF
 services:
   remnanode:
@@ -1677,11 +1876,12 @@ services:
       options:
         max-size: "30m"
         max-file: "5"
-    environment:
+${LOGS_VOLUME_BLOCK}    environment:
       - NODE_PORT=${NODE_PORT}
       - SECRET_KEY="${SECRET_KEY}"
 EOF
         chmod 0600 /opt/remnanode/docker-compose.yml
+        [[ $NODE_LOGS -eq 1 ]] && { mkdir -p /var/log/remnanode; chmod 0755 /var/log/remnanode; }
 
         # 3) Поднять контейнер и дождаться запуска
         info "Поднимаю контейнер ноды..."
@@ -1705,6 +1905,19 @@ EOF
     else
         step_fail "9/10 Remnanode (не установилась — см. сообщения выше)"
     fi
+fi
+
+# --- Логи ноды в файлах + ротация (та же логика, что в nodectl → пункт «l») ---
+if [[ $NODE_LOGS -eq 1 && -f /opt/remnanode/docker-compose.yml ]]; then
+    info "Логи ноды: файлы /var/log/remnanode + ротация logrotate..."
+    if install_node_logs; then
+        success "Логи ноды пишутся в /var/log/remnanode (access.log, error.log), ротация 50 МБ × 5."
+        step_ok "9/10 Логи ноды (файлы + ротация)"
+    else
+        step_fail "9/10 Логи ноды (см. сообщения выше)"
+    fi
+elif [[ $NODE_LOGS -eq 1 ]]; then
+    warn "Логи ноды: нода не установлена — пропуск."
 fi
 
 #===============================================================================

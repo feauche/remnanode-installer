@@ -35,6 +35,7 @@ bash <(curl -sL https://raw.githubusercontent.com/feauche/remnanode-installer/ma
 - **Секретный ключ ноды** — из панели: `Nodes → Add Node → Secret Key`.
 - **Порт ноды** — то же значение, что в поле «Node Port» панели (по умолчанию `2420`).
 - **Версия ноды** — `latest` (для панели версии 3 и выше) или `2.8.0` (для панели версии до 3).
+- **Логи ноды** — писать `access.log` и `error.log` в `/var/log/remnanode` с ротацией logrotate (50 МБ × 5, по умолчанию да) или оставить внутри контейнера. Позже это включается пунктом «l» в `nodectl`.
 
 ## Что делает скрипт (по шагам)
 
@@ -66,6 +67,10 @@ bash <(curl -sL https://raw.githubusercontent.com/feauche/remnanode-installer/ma
 
   6) Логи firewall
 
+🖥️ Нода
+  9) Xray-core (своя версия / дефолт)
+  l) Логи ноды (файлы + ротация) — access.log и error.log в /var/log/remnanode, logrotate 50 МБ × 5
+
 📦 Установки (дополнения)
   7) Psiphon — обход RU-метки IP, чтобы работал Gemini
   8) Selfsteal — маскировка Reality (обёртка над selfsteal.sh)
@@ -77,6 +82,8 @@ bash <(curl -sL https://raw.githubusercontent.com/feauche/remnanode-installer/ma
 - `nodectl status` — краткий статус (сервисы, ядро, состояние ноды)
 - `nodectl restart` — перезапустить ноду
 - `nodectl update` — обновить образ ноды (до тега из `docker-compose.yml`)
+- `nodectl logs [access|error] [N]` — хвост логов ноды из `/var/log/remnanode` (если включены)
+- `nodectl logs-enable` — вывести логи ноды в файлы + ротация (то же, что пункт «l» меню)
 - `nodectl update-self` — обновить только команду `nodectl` из GitHub (закалка, UFW и нода не трогаются)
 
 Перезапуск, обновление ноды, статус и обновление скрипта есть и в самом меню
