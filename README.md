@@ -11,7 +11,7 @@
 - **Всё в одной команде.** Спрашивает SSH-порт, секретный ключ и порт ноды, версию — и настраивает сервер без лишних вопросов.
 - **Полная закалка сервера:** UFW firewall, миграция SSH-порта (с авто-откатом), Fail2Ban, hardening ядра, тюнинг сети и лимитов под тысячи клиентов, авто-обновления безопасности, анти-флуд (SYN/скан), Docker+UFW fix.
 - **Установка ноды.** Ставит Docker и поднимает официальный контейнер `remnawave/node` (версия `latest` для панели 3+ или `2.8.0` для панели до 3 — на выбор) с ротацией логов.
-- **Команда `nodectl`** — простое меню управления безопасностью и дополнениями (geoblock, IPv6/ICMP, SYNPROXY, Psiphon для Gemini, Selfsteal для Reality, удаление ноды).
+- **Команда `nodectl`** — простое меню управления безопасностью и дополнениями (geoblock, IPv6/ICMP, SYNPROXY, Psiphon для Gemini, WARP Native, Selfsteal для Reality, удаление ноды).
 - **Обфускация.** Служебные файлы получают непрозрачные имена (уникальные для сервера) — по ним труднее опознать ноду.
 
 ## Требования
@@ -69,11 +69,13 @@ bash <(curl -sL https://raw.githubusercontent.com/feauche/remnanode-installer/ma
 
 🖥️ Нода
   9) Xray-core (своя версия / дефолт)
-  l) Логи ноды (файлы + ротация) — access.log и error.log в /var/log/remnanode, logrotate 50 МБ × 5
+  l) Логи ноды — файлы + ротация (access.log и error.log в /var/log/remnanode, logrotate 50 МБ × 5)
+     и живые логи контейнера (docker compose logs -f)
 
 📦 Установки (дополнения)
   7) Psiphon — обход RU-метки IP, чтобы работал Gemini
   8) Selfsteal — маскировка Reality (обёртка над selfsteal.sh)
+  w) WARP Native — выход нужных доменов через Cloudflare WARP (интерфейс WireGuard «warp»)
 
   u) Удалить ноду (полностью)
 ```
@@ -82,7 +84,8 @@ bash <(curl -sL https://raw.githubusercontent.com/feauche/remnanode-installer/ma
 - `nodectl status` — краткий статус (сервисы, ядро, состояние ноды)
 - `nodectl restart` — перезапустить ноду
 - `nodectl update` — обновить образ ноды (до тега из `docker-compose.yml`)
-- `nodectl logs [access|error] [N]` — хвост логов ноды из `/var/log/remnanode` (если включены)
+- `nodectl logs` — живые логи контейнера ноды: то же, что `cd /opt/remnanode && docker compose logs -f`; выход — `Ctrl+C`. Дополнительные параметры уходят в `docker compose logs`, например `nodectl logs --tail 100`
+- `nodectl logs access|error [N]` — хвост файлов логов ноды из `/var/log/remnanode` (если включены)
 - `nodectl logs-enable` — вывести логи ноды в файлы + ротация (то же, что пункт «l» меню)
 - `nodectl update-self` — обновить только команду `nodectl` из GitHub (закалка, UFW и нода не трогаются)
 
@@ -90,7 +93,7 @@ bash <(curl -sL https://raw.githubusercontent.com/feauche/remnanode-installer/ma
 (пункты `r`, `n`, `i`, `s`), короткие команды дублируют их для скриптов и cron.
 
 Прямо в меню видно текущее состояние: у геоблока/IPv6/ICMP — галочка/крестик,
-у Psiphon/Selfsteal — «установлено / не установлено», у Xray-core — «из образа / вручную».
+у Psiphon/WARP/Selfsteal — «установлено / не установлено», у Xray-core — «из образа / вручную».
 
 > ⚠️ **Геоблокировка** блокирует выбранные страны **на всех портах** — полностью
 > закрывает сервер для этих стран. НЕ добавляйте туда страны своих VPN-клиентов
@@ -99,6 +102,7 @@ bash <(curl -sL https://raw.githubusercontent.com/feauche/remnanode-installer/ma
 ### Дополнения (ставятся по желанию, требуют уже установленной ноды)
 - **Psiphon** — поднимает локальный SOCKS5 для обхода RU-метки IP (чтобы заработал Gemini). Маршрутизация нужных доменов настраивается в конфиге Xray на панели.
 - **Selfsteal** — веб-сервер-обманка для маскировки Reality (Caddy или Nginx). Пункт меню показывает готовый конфиг Xray для панели.
+- **WARP Native** — ставит Cloudflare WARP как интерфейс WireGuard `warp` (без `warp-cli`, установщик [distillium/warp-native](https://github.com/distillium/warp-native)) с watchdog и kill-switch. Пункт `w` меню: установка, статус и проверка выхода, перезапуск, лог watchdog, удаление и готовые **outbound `warp-out` + правило routing** для конфига Xray на панели. Установщик WARP сам задаёт вопросы: язык, ключ WARP+ (Enter — пропустить) и интервал проверки (Enter — 5 минут). Перед удалением WARP уберите `warp-out` и его правило из конфига на панели, иначе трафик по этому правилу перестанет проходить.
 
 ## Обновление скрипта
 

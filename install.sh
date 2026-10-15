@@ -5,7 +5,7 @@
 #              firewall, fail2ban, kernel hardening, сеть/лимиты, авто-обновления,
 #              анти-флуд, установка Docker + ноды Remnawave, Docker+UFW fix,
 #              и команда управления `nodectl` (geoblock, IPv6/ICMP, SYNPROXY,
-#              Psiphon для Gemini, Selfsteal для Reality).
+#              Psiphon для Gemini, WARP Native, Selfsteal для Reality).
 #===============================================================================
 
 set -uo pipefail
@@ -197,6 +197,13 @@ show_status() {
         printf "  %-24s %b\n" "SYNPROXY" "${G}включён${N}"
     else
         printf "  %-24s %b\n" "SYNPROXY" "${GR}выключен${N}"
+    fi
+    if _warp_installed; then
+        if systemctl is-active --quiet wg-quick@warp 2>/dev/null; then
+            printf "  %-24s %b\n" "WARP" "${G}активен${N}"
+        else
+            printf "  %-24s %b\n" "WARP" "${R}не активен${N}"
+        fi
     fi
     if [[ -f "$NODE_COMPOSE" ]]; then
         if _xray_custom_on; then
@@ -743,6 +750,157 @@ menu_selfsteal() {
     done
 }
 
+# ---------- WARP Native (выход через Cloudflare WARP, distillium/warp-native) ----------
+WARP_URL="https://raw.githubusercontent.com/distillium/warp-native/main/install.sh"
+WARP_UNINSTALL_URL="https://raw.githubusercontent.com/distillium/warp-native/main/uninstall.sh"
+WARP_WATCHDOG_LOG="/opt/warp-native/logs/watchdog.log"
+
+_warp_installed() { [[ -x /usr/local/bin/warp && -f /etc/wireguard/warp.conf ]]; }
+
+warp_install() {
+    local a
+    if _warp_installed; then
+        echo -e "${Y}WARP уже установлен.${N} Аккаунт WARP сохранится, интерфейс и watchdog настроятся заново."
+        read -rp "  Переустановить? [y/N]: " a || return 0
+        case "${a:-}" in y|Y|yes|YES|д|Д|да|Да|ДА) ;; *) return 0 ;; esac
+    fi
+    echo -e "${C}Скачиваю и ставлю WARP Native (интерфейс WireGuard «warp», без warp-cli)...${N}"
+    echo -e "${GR}Установщик спросит: язык, ключ WARP+ (Enter — пропустить) и интервал проверки (Enter — 5 минут).${N}"
+    local t; t=$(mktemp)
+    if curl -fsSL "$WARP_URL" -o "$t"; then
+        bash "$t"
+        rm -f "$t"
+        if _warp_installed; then
+            echo -e "${G}WARP установлен.${N} Теперь добавьте outbound+routing в панель (пункт 3 меню)."
+        else
+            echo -e "${R}WARP не установился — смотрите вывод выше.${N}"
+        fi
+    else
+        rm -f "$t"; echo -e "${R}Не удалось скачать установщик WARP.${N}"
+    fi
+}
+
+warp_show_xray() {
+    cat <<'XRAY'
+--- Добавьте это в конфиг Xray на панели Remnawave ---
+
+1) OUTBOUND (в массив "outbounds"):
+{
+  "tag": "warp-out",
+  "protocol": "freedom",
+  "settings": {
+    "domainStrategy": "ForceIPv4"
+  },
+  "streamSettings": {
+    "sockopt": {
+      "interface": "warp",
+      "mark": 51888,
+      "tcpFastOpen": true
+    }
+  }
+}
+
+2) ROUTING-ПРАВИЛО (в "routing" -> "rules"; домены и теги inbound — примеры, замените на свои):
+{
+  "type": "field",
+  "domain": [
+    "netflix.com",
+    "youtube.com",
+    "twitter.com"
+  ],
+  "inboundTag": [
+    "Node-1",
+    "Node-2"
+  ],
+  "outboundTag": "warp-out"
+}
+
+Важно:
+- "mark": 51888 включает kill-switch: если интерфейс warp упадёт, трафик по этому outbound
+  не уйдёт на обычное подключение сервера (и не раскроет его IP), а будет отброшен.
+  Не удаляйте mark.
+- Заворачивайте в WARP только нужные домены, а не весь трафик.
+XRAY
+}
+
+warp_status() {
+    if ! _warp_installed; then echo -e "${Y}Не установлен.${N}"; return 1; fi
+    /usr/local/bin/warp
+}
+
+warp_restart() {
+    if ! _warp_installed; then echo -e "${Y}Не установлен.${N}"; return 1; fi
+    echo -e "${C}Перезапускаю интерфейс warp...${N}"
+    if systemctl restart wg-quick@warp; then
+        echo -e "${G}Готово.${N}"
+    else
+        echo -e "${R}Не удалось перезапустить (см. journalctl -u wg-quick@warp -n 30).${N}"
+    fi
+}
+
+warp_log() {
+    if [[ -f "$WARP_WATCHDOG_LOG" ]]; then
+        tail -n 50 "$WARP_WATCHDOG_LOG"
+    else
+        echo -e "${GR}Лог пока пуст — watchdog ещё не запускался.${N}"
+    fi
+}
+
+warp_uninstall() {
+    local a
+    if ! _warp_installed; then echo -e "${Y}Не установлен.${N}"; return 0; fi
+    echo -e "${Y}Сначала уберите outbound «warp-out» и его правило из конфига Xray на панели:${N}"
+    echo -e "${GR}иначе трафик по этому правилу перестанет проходить — интерфейса warp больше не будет.${N}"
+    read -rp "  Удалить WARP? [y/N]: " a || return 0
+    case "${a:-}" in y|Y|yes|YES|д|Д|да|Да|ДА) ;; *) echo "Отменено."; return 0 ;; esac
+    local t; t=$(mktemp)
+    if curl -fsSL "$WARP_UNINSTALL_URL" -o "$t"; then
+        bash "$t"
+        rm -f "$t"
+    else
+        rm -f "$t"; echo -e "${R}Не удалось скачать скрипт удаления WARP.${N}"
+    fi
+}
+
+menu_warp() {
+    local a
+    while true; do
+        hdr "WARP Native — выход через Cloudflare WARP"
+        if _warp_installed; then
+            if systemctl is-active --quiet wg-quick@warp 2>/dev/null; then
+                echo -e "  Статус: ${G}установлен, интерфейс warp активен${N}"
+            else
+                echo -e "  Статус: ${Y}установлен, интерфейс warp не активен${N}"
+            fi
+        else
+            echo -e "  Статус: ${GR}не установлен${N}"
+        fi
+        echo ""
+        echo -e "  ${GR}Интерфейс WireGuard «warp» на сервере (без warp-cli). Чтобы нужные домены${N}"
+        echo -e "  ${GR}пошли через WARP, добавьте outbound+routing в конфиг Xray на панели (пункт 3).${N}"
+        echo ""
+        echo "  1) Установить"
+        echo "  2) Статус и проверка выхода (IP, страна, ChatGPT)"
+        echo "  3) Показать outbound+routing для панели"
+        echo "  4) Перезапустить интерфейс"
+        echo "  5) Лог watchdog"
+        echo "  6) Удалить"
+        echo ""
+        echo "  0) Назад"
+        read -rp "$PROMPT" a || return
+        case "${a:-}" in
+            1) warp_install; pause ;;
+            2) warp_status; pause ;;
+            3) warp_show_xray; pause ;;
+            4) warp_restart; pause ;;
+            5) warp_log; pause ;;
+            6) warp_uninstall; pause ;;
+            0|q|"") return ;;
+            *) echo -e "${Y}Неверный выбор.${N}"; sleep 1 ;;
+        esac
+    done
+}
+
 # ---------- Кастомный Xray-core ----------
 _xray_arch() {
     case "$(uname -m)" in
@@ -858,6 +1016,17 @@ node_logs_tail() {   # access|error [строк]
     tail -n "$n" "$f"
 }
 
+# Живые логи контейнера ноды: то же, что `cd /opt/remnanode && docker compose logs -f`.
+# Ctrl+C останавливает просмотр и возвращает в меню (а не закрывает nodectl); лишние
+# параметры уходят в docker compose logs (например: nodectl logs --tail 100).
+node_logs_follow() {
+    [[ -f "$NODE_COMPOSE" ]] || { echo -e "${R}Нода не установлена (/opt/remnanode).${N}"; return 1; }
+    echo -e "${GR}Логи контейнера remnanode (docker compose logs -f). Выход — Ctrl+C.${N}"
+    trap ':' INT
+    ( cd /opt/remnanode && exec docker compose logs -f "$@" )
+    trap - INT
+}
+
 menu_node_logs() {
     local a st sz
     while true; do
@@ -871,6 +1040,7 @@ menu_node_logs() {
         echo "  2) Показать хвост access.log"
         echo "  3) Показать хвост error.log"
         echo "  4) Выключить (вернуть логи в контейнер)"
+        echo "  5) Живые логи контейнера (docker compose logs -f)"
         echo "  0) Назад"
         read -rp "$PROMPT" a || return
         case "${a:-}" in
@@ -878,6 +1048,7 @@ menu_node_logs() {
             2) echo ""; node_logs_tail access 60; pause ;;
             3) echo ""; node_logs_tail error 60; pause ;;
             4) echo ""; node_logs_disable; pause ;;
+            5) echo ""; node_logs_follow; echo "" ;;
             0) return ;;
         esac
     done
@@ -1081,7 +1252,8 @@ nodectl — управление нодой и безопасностью
   nodectl status       показать статус
   nodectl restart      перезапустить ноду
   nodectl update       обновить ноду (до тега из docker-compose.yml)
-  nodectl logs [access|error] [N]   хвост логов ноды из /var/log/remnanode (если включены)
+  nodectl logs         живые логи контейнера ноды (docker compose logs -f в /opt/remnanode), выход — Ctrl+C
+  nodectl logs access|error [N]   хвост файлов логов ноды из /var/log/remnanode (если включены)
   nodectl logs-enable  вывести логи ноды в файлы + ротация (то же, что пункт «l» меню)
   nodectl update-self  обновить только сам nodectl из GitHub (закалка и UFW не трогаются)
 Все команды доступны и как пункты меню.
@@ -1090,12 +1262,13 @@ U
 }
 
 main_menu() {
-    local psi_c ss_c ch geo_b ipv6_b icmp_b psi_b ss_b xray_b logs_b
+    local psi_c ss_c warp_c ch geo_b ipv6_b icmp_b psi_b ss_b warp_b xray_b logs_b
     while true; do
         clear
         # Psiphon / Selfsteal: цвет пункта + метка справа.
         if command -v vps-psiphon >/dev/null 2>&1; then psi_c="$G"; psi_b="${G}(установлено)${N}"; else psi_c="$R"; psi_b="${R}(не установлено)${N}"; fi
         if command -v selfsteal   >/dev/null 2>&1; then ss_c="$G";  ss_b="${G}(установлено)${N}";  else ss_c="$R";  ss_b="${R}(не установлено)${N}"; fi
+        if _warp_installed; then warp_c="$G"; warp_b="${G}(установлено)${N}"; else warp_c="$R"; warp_b="${R}(не установлено)${N}"; fi
         # Геоблок.
         if ipset list "$GEO_SET" -terse &>/dev/null; then geo_b="${G}✅ включён${N}"; else geo_b="${GR}⚪ выключен${N}"; fi
         # IPv6: ✅ если включён, ❌ если отключён.
@@ -1127,6 +1300,7 @@ main_menu() {
         echo -e "${GR}──── 📦 Установки ────${N}"
         echo -e "  7) ${psi_c}🌀 Psiphon (обход RU-метки, для Gemini)${N}   ${psi_b}"
         echo -e "  8) ${ss_c}🎭 Selfsteal (маскировка Reality)${N}   ${ss_b}"
+        echo -e "  w) ${warp_c}☁️  WARP Native (выход через Cloudflare WARP)${N}   ${warp_b}"
         echo ""
         echo -e "${GR}──── 🖥️  Нода ────${N}"
         echo -e "  9) 🧬 Xray-core (своя версия / дефолт)   ${xray_b}"
@@ -1150,6 +1324,7 @@ main_menu() {
             6) show_logs; pause ;;
             7) menu_psiphon ;;
             8) menu_selfsteal ;;
+            w|W) menu_warp ;;
             9) menu_xray ;;
             l|L) menu_node_logs ;;
             r|R) node_restart; pause ;;
@@ -1169,7 +1344,11 @@ case "$cmd" in
     menu|"")     need_root; main_menu ;;
     restart)     need_root; node_restart ;;
     update)      need_root; node_update ;;
-    logs)        need_root; node_logs_tail "${2:-access}" "${3:-50}" ;;
+    logs)        need_root
+                 case "${2:-}" in
+                     access|error) node_logs_tail "$2" "${3:-50}" ;;
+                     *)            node_logs_follow "${@:2}" ;;
+                 esac ;;
     logs-enable) need_root; node_logs_enable ;;
     update-self) need_root; node_selfupdate ;;
     geo-reapply) need_root; geo_reapply ;;
@@ -2077,5 +2256,5 @@ echo -e "  Статус Fail2Ban:   ${CYAN}fail2ban-client status sshd${RESET}"
 echo -e "  Congestion/qdisc:  ${CYAN}sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc${RESET}"
 echo -e "${YELLOW}========================================${RESET}"
 echo ""
-info "Маскировка Reality (Selfsteal), Psiphon и прочее — через команду: nodectl"
+info "Маскировка Reality (Selfsteal), Psiphon, WARP и прочее — через команду: nodectl"
 echo ""
