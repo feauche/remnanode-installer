@@ -911,36 +911,126 @@ _xray_arch() {
     esac
 }
 _xray_cver() { docker exec remnanode xray version 2>/dev/null | head -1 | awk '{print $2}'; }
-# Единый блок volumes в docker-compose.yml (маркер ${VOL_MARK}): пункты добавляются и убираются
+# То же после пересоздания: контейнеру нужно несколько секунд, ждём до 20 с.
+_xray_cver_wait() {
+    local i v
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        v=$(_xray_cver); [[ -n "$v" ]] && { echo "$v"; return 0; }
+        sleep 2
+    done
+}
+# Единый блок томов в docker-compose.yml (маркер ${VOL_MARK}): пункты добавляются и убираются
 # по одному, старый блок xray (xraybegin/xrayend) переносится в него автоматически.
-# Два ключа volumes: в одном сервисе — невалидный YAML, поэтому блок один на всех.
+# Два ключа volumes: в одном сервисе — невалидный YAML. Если ключ уже есть (ноду ставил другой
+# скрипт), наш блок встаёт внутрь его списка. Второй том на тот же путь в контейнере Docker
+# не примет — такой add отказывает. Коды: 2 — путь уже занят чужой строкой, 3 — del строки,
+# которую вписал не nodectl, 4 — volumes записан в одну строку.
 _compose_mount() {   # add|del "<host>:<container>"
     python3 - "$NODE_COMPOSE" "$VOL_MARK" "$1" "$2" <<'PY'
 import sys, re
 f, mark, action, item = sys.argv[1:5]
-b = "    # %s-volbegin" % mark; e = "    # %s-volend" % mark
+tgt = (item.split(':') + [''])[1]
 c = open(f).read()
+if not c.endswith('\n'):
+    c += '\n'
 items = []
-legacy = re.search(r'\n    # (\S+)-xraybegin\n(.*?)\n    # \1-xrayend\n', c, re.DOTALL)
-if legacy:
-    items += [l.strip()[2:].strip() for l in legacy.group(2).splitlines() if l.strip().startswith('- ')]
-    c = c[:legacy.start()] + "\n" + c[legacy.end():]
-m = re.search(r'\n' + re.escape(b) + r'\n(.*?)\n' + re.escape(e) + r'\n', c, re.DOTALL)
-if m:
-    items += [l.strip()[2:].strip() for l in m.group(1).splitlines() if l.strip().startswith('- ')]
-    c = c[:m.start()] + "\n" + c[m.end():]
-items = [i for i in items if i != item]
+def take(rx):
+    global c, items
+    m = re.search(rx, c, re.DOTALL)
+    if m:
+        items += [l.strip()[2:].strip() for l in m.group(m.lastindex).splitlines() if l.strip().startswith('- ')]
+        c = c[:m.start()] + "\n" + c[m.end():]
+take(r'\n[ \t]*# (\S+)-xraybegin\n(.*?)\n[ \t]*# \1-xrayend\n')
+take(r'\n[ \t]*# ' + re.escape(mark) + r'-volbegin\n(.*?)\n[ \t]*# ' + re.escape(mark) + r'-volend\n')
+own = [i for i in dict.fromkeys(items) if i != item]
 if action == 'add':
-    items.append(item)
-if items:
-    block = "%s\n    volumes:\n%s\n%s\n" % (b, "\n".join("      - " + i for i in items), e)
-    mm = re.search(r'^    environment:', c, re.M)
-    c = c[:mm.start()] + block + c[mm.start():] if mm else c.rstrip() + "\n" + block
+    own.append(item)
+# Чужой список volumes: в сервисе и его пункты.
+vm = re.search(r'^    volumes:[ \t]*(#.*)?$', c, re.M)
+if not vm and re.search(r'^    volumes:', c, re.M) and own:
+    print("volumes в docker-compose.yml записан в одну строку — дописать в него не могу", file=sys.stderr); sys.exit(4)
+foreign, ind = [], None
+if vm:
+    for l in c[vm.end() + 1:].split('\n'):
+        s = l.strip()
+        if not s or s.startswith('#'):
+            continue
+        if re.match(r'^ {4,}- ', l):
+            ind = ind or re.match(r'^ *', l).group(0)
+            foreign.append((re.sub(r'\s+#.*$', '', s[2:]).strip().strip('\'"'), s))
+        elif not re.match(r'^ {5,}\S', l):
+            break
+if action == 'add':
+    if any(v == item for v, s in foreign):
+        own.remove(item)   # уже подключено чужой строкой — дублировать не нужно
+    else:
+        for v, s in foreign:
+            if (v.split(':') + [''])[1] == tgt:
+                print("путь %s в контейнере уже подключён строкой: %s" % (tgt, s), file=sys.stderr); sys.exit(2)
+elif item not in items and any(v == item for v, s in foreign):
+    print("строку %s вписал в docker-compose.yml не nodectl — уберите её вручную" % item, file=sys.stderr); sys.exit(3)
+if own:
+    if vm:
+        ind = ind or "      "
+        block = "%s# %s-volbegin\n%s\n%s# %s-volend\n" % (ind, mark, "\n".join(ind + "- " + i for i in own), ind, mark)
+        p = vm.end() + 1
+        c = c[:p] + block + c[p:]
+    else:
+        block = "    # %s-volbegin\n    volumes:\n%s\n    # %s-volend\n" % (mark, "\n".join("      - " + i for i in own), mark)
+        mm = re.search(r'^    (environment|env_file):', c, re.M)
+        sm = re.search(r'^  remnanode:[^\n]*\n', c, re.M)
+        if mm:
+            c = c[:mm.start()] + block + c[mm.start():]
+        elif sm:
+            c = c[:sm.end()] + block + c[sm.end():]
+        else:
+            c = c.rstrip() + "\n" + block
 open(f, 'w').write(c); print("OK")
 PY
 }
 
-_xray_custom_on() { grep -q -- "- ${XRAY_BIN}:/usr/local/bin/xray" "$NODE_COMPOSE" 2>/dev/null; }
+# Пересоздаёт контейнер ноды. Сначала проверяет docker-compose.yml: с ошибкой в файле Docker
+# контейнер не трогает — тогда код 2. Код 1 — Docker не смог пересоздать. Ошибку печатает.
+_node_recreate() {
+    local out
+    if ! out=$(cd /opt/remnanode && docker compose config -q 2>&1); then
+        echo -e "${R}Docker не принимает docker-compose.yml:${N}"; printf '%s\n' "$out" | tail -5
+        return 2
+    fi
+    if ! out=$(cd /opt/remnanode && docker compose up -d --force-recreate 2>&1); then
+        echo -e "${R}Не удалось пересоздать контейнер:${N}"; printf '%s\n' "$out" | tail -8
+        return 1
+    fi
+}
+
+# Возвращает docker-compose.yml из копии после неудачи _node_recreate (второй аргумент — её код)
+# и, если контейнер уже трогали, поднимает ноду на прежнем файле.
+_node_restore() {   # копия код
+    [[ -f "$1" ]] && cp "$1" "$NODE_COMPOSE"
+    if [[ "$2" -eq 2 ]]; then
+        echo -e "${Y}docker-compose.yml возвращён как был, нода не тронута.${N}"
+    elif ( cd /opt/remnanode && docker compose up -d --force-recreate ) >/dev/null 2>&1; then
+        echo -e "${Y}docker-compose.yml возвращён как был, нода поднята на нём.${N}"
+    else
+        echo -e "${R}Нода не поднялась и на прежнем файле — проверьте: cd /opt/remnanode && docker compose up -d${N}"
+    fi
+}
+
+# Откуда на хосте монтируется ядро (/usr/local/bin/xray в контейнере); пусто — встроенное из образа.
+# Свой том nodectl — ${XRAY_BIN}. Если ноду ставил другой скрипт, ядро может идти из его файла
+# (например /var/lib/remnanode/xray): такой путь главнее — второй том на тот же путь Docker не примет.
+_xray_mount_src() {
+    local s own=""
+    while read -r s; do
+        [[ "$s" == "$XRAY_BIN" ]] && { own=1; continue; }
+        echo "$s"; return 0
+    done < <(sed -nE "s|^[[:space:]]*-[[:space:]]*['\"]?([^:'\"[:space:]]+):/usr/local/bin/xray(:[a-z,]+)?['\"]?[[:space:]]*(#.*)?\$|\1|p" "$NODE_COMPOSE" 2>/dev/null)
+    [[ -n "$own" ]] && echo "$XRAY_BIN"
+    return 0
+}
+_xray_fver() { [[ -x "$1" ]] && "$1" version 2>/dev/null | head -1 | awk '{print $2}'; }
+_xray_custom_on() { [[ -n "$(_xray_mount_src)" ]]; }
+_xray_own_on() { grep -q -- "- ${XRAY_BIN}:/usr/local/bin/xray" "$NODE_COMPOSE" 2>/dev/null; }
 _xray_add_mount() { _compose_mount add "${XRAY_BIN}:/usr/local/bin/xray"; }
 _xray_del_mount() { _compose_mount del "${XRAY_BIN}:/usr/local/bin/xray"; }
 
@@ -973,11 +1063,11 @@ ROT
 node_logs_enable() {
     [[ -f "$NODE_COMPOSE" ]] || { echo -e "${R}Нода не установлена.${N}"; return 1; }
     mkdir -p "$LOG_DIR" && chmod 0755 "$LOG_DIR"
-    local changed=0
+    local changed=0 bak rc
     if _logs_on; then
         echo -e "${G}✓${N} Каталог ${LOG_DIR} уже монтируется в контейнер."
     else
-        cp "$NODE_COMPOSE" "${NODE_COMPOSE}.bak.$(date +%s)"
+        bak="${NODE_COMPOSE}.bak.$(date +%s)"; cp "$NODE_COMPOSE" "$bak"
         _compose_mount add "$LOG_MOUNT" >/dev/null || { echo -e "${R}Не удалось изменить docker-compose.yml.${N}"; return 1; }
         echo -e "${G}✓${N} В docker-compose.yml добавлен том ${LOG_MOUNT}."
         changed=1
@@ -989,10 +1079,11 @@ node_logs_enable() {
     fi
     if [[ $changed -eq 1 ]]; then
         echo -e "${C}Пересоздаю контейнер ноды, чтобы подхватил том...${N}"
-        if ( cd /opt/remnanode && docker compose up -d --force-recreate ) >/dev/null 2>&1; then
+        _node_recreate; rc=$?
+        if [[ $rc -eq 0 ]]; then
             echo -e "${G}✓${N} Нода перезапущена."
         else
-            echo -e "${R}Не удалось пересоздать контейнер (см. cd /opt/remnanode && docker compose logs).${N}"; return 1
+            _node_restore "$bak" "$rc"; return 1
         fi
     fi
     echo -e "${G}Готово.${N} Логи: ${C}${LOG_DIR}/access.log${N} и ${C}${LOG_DIR}/error.log${N}"
@@ -1002,10 +1093,12 @@ node_logs_enable() {
 node_logs_disable() {
     [[ -f "$NODE_COMPOSE" ]] || { echo -e "${R}Нода не установлена.${N}"; return 1; }
     _logs_on || { echo -e "${GR}Логи и так внутри контейнера.${N}"; return 0; }
-    cp "$NODE_COMPOSE" "${NODE_COMPOSE}.bak.$(date +%s)"
-    _compose_mount del "$LOG_MOUNT" >/dev/null || { echo -e "${R}Не удалось изменить docker-compose.yml.${N}"; return 1; }
+    local bak rc
+    bak="${NODE_COMPOSE}.bak.$(date +%s)"; cp "$NODE_COMPOSE" "$bak"
+    _compose_mount del "$LOG_MOUNT" >/dev/null || { echo -e "${R}Не удалось изменить docker-compose.yml.${N}"; rm -f "$bak"; return 1; }
+    _node_recreate; rc=$?
+    [[ $rc -eq 0 ]] || { _node_restore "$bak" "$rc"; return 1; }
     rm -f "$LOGROTATE_CONF"
-    ( cd /opt/remnanode && docker compose up -d --force-recreate ) >/dev/null 2>&1 || true
     echo -e "${G}✓${N} Том отключён, ротация снята. Файлы в ${LOG_DIR} не тронуты."
 }
 
@@ -1089,51 +1182,115 @@ xray_install_version() {
     echo -e "${C}Скачиваю Xray-core ${ver} (${arch})...${N}"
     local tmp; tmp=$(mktemp -d)
     if ! curl -fsSL "$url" -o "$tmp/x.zip"; then rm -rf "$tmp"; echo -e "${R}Не скачалось: $url${N}"; return 1; fi
-    mkdir -p /opt/remnanode
-    if ! unzip -o "$tmp/x.zip" xray -d /opt/remnanode >/dev/null 2>&1; then rm -rf "$tmp"; echo -e "${R}В архиве нет бинарника xray (или архив повреждён).${N}"; return 1; fi
-    rm -rf "$tmp"; chmod +x "$XRAY_BIN"
-    _xray_add_mount
-    echo -e "${C}Пересоздаю контейнер...${N}"
-    if ! ( cd /opt/remnanode && docker compose up -d --force-recreate ) >/dev/null 2>&1; then
-        echo -e "${R}Не удалось пересоздать контейнер (см. cd /opt/remnanode && docker compose logs).${N}"; return 1
+    if ! unzip -o "$tmp/x.zip" xray -d "$tmp" >/dev/null 2>&1; then rm -rf "$tmp"; echo -e "${R}В архиве нет бинарника xray (или архив повреждён).${N}"; return 1; fi
+    chmod +x "$tmp/xray"
+    # Проверяем ядро до того, как что-то менять: запускается ли оно на этом сервере.
+    local nv; nv=$(_xray_fver "$tmp/xray")
+    if [[ -z "$nv" ]]; then rm -rf "$tmp"; echo -e "${R}Скачанный xray не запускается на этом сервере.${N}"; return 1; fi
+
+    # Куда класть: если ядро уже подключено из файла другого скрипта — в этот же файл
+    # (второй том на тот же путь Docker не примет), иначе — свой ${XRAY_BIN} и том на него.
+    local src dst bak rc orig=""
+    src=$(_xray_mount_src); dst="${src:-$XRAY_BIN}"
+    bak="${NODE_COMPOSE}.bak.$(date +%s)"; cp "$NODE_COMPOSE" "$bak"
+    if [[ "$dst" != "$XRAY_BIN" ]]; then
+        # Прошлые версии nodectl дописывали тут второй ключ volumes — убираем его.
+        if _xray_own_on && ! _xray_del_mount >/dev/null; then
+            rm -rf "$tmp"; echo -e "${R}Не удалось изменить docker-compose.yml.${N}"; return 1
+        fi
+        [[ -f "$dst" && ! -e "${dst}.orig" ]] && cp -p "$dst" "${dst}.orig" && orig="${dst}.orig"
+        echo -e "${GR}Ядро подключено из ${dst} (так ноду настроил другой скрипт) — кладу новое туда же; прежнее сохранено в ${dst}.orig.${N}"
     fi
-    sleep 4
-    local cv; cv=$(_xray_cver)
-    if [[ -n "$cv" ]]; then
+    cp "$NODE_COMPOSE" "$tmp/compose"   # откат — к этому состоянию (лишний том уже убран)
+    [[ -f "$dst" ]] && cp -p "$dst" "$tmp/prev"
+    mkdir -p "$(dirname "$dst")"
+    # install, а не cp: поверх файла, который сейчас запущен в контейнере, cp выдаёт «Text file busy».
+    if ! install -m 0755 "$tmp/xray" "$dst"; then
+        rm -rf "$tmp"; [[ -n "$orig" ]] && rm -f "$orig"; echo -e "${R}Не удалось записать ${dst}.${N}"; return 1
+    fi
+    if [[ -z "$src" ]] && ! _xray_add_mount >/dev/null; then
+        if [[ -f "$tmp/prev" ]]; then install -m 0755 "$tmp/prev" "$dst"; else rm -f "$dst"; fi
+        cp "$tmp/compose" "$NODE_COMPOSE"; rm -rf "$tmp"
+        echo -e "${R}Не удалось изменить docker-compose.yml — ничего не поменял.${N}"; return 1
+    fi
+    echo -e "${C}Пересоздаю контейнер...${N}"
+    _node_recreate; rc=$?
+    if [[ $rc -ne 0 ]]; then
+        if [[ -f "$tmp/prev" ]]; then install -m 0755 "$tmp/prev" "$dst"; else rm -f "$dst"; fi
+        _node_restore "$tmp/compose" "$rc"; rm -rf "$tmp"; [[ -n "$orig" ]] && rm -f "$orig"
+        echo -e "${GR}Ядро тоже возвращено прежнее.${N}"; return 1
+    fi
+    rm -rf "$tmp"
+    local cv; cv=$(_xray_cver_wait)
+    if [[ "$cv" == "$nv" ]]; then
         echo -e "${G}Готово. Версия Xray в контейнере: ${cv}.${N}"
+    elif [[ -n "$cv" ]]; then
+        echo -e "${R}В контейнере Xray ${cv}, а положено ${nv} — ядро не подхватилось (см. nodectl logs).${N}"; return 1
     else
-        echo -e "${R}Контейнер не поднялся / Xray не отвечает (см. cd /opt/remnanode && docker compose logs).${N}"; return 1
+        echo -e "${R}Контейнер не поднялся / Xray не отвечает (см. nodectl logs).${N}"; return 1
     fi
 }
 
 xray_revert() {
     [[ -f "$NODE_COMPOSE" ]] || { echo -e "${R}Нода не установлена.${N}"; return 1; }
-    if ! _xray_custom_on; then echo -e "${Y}Уже используется дефолтная версия.${N}"; return; fi
-    _xray_del_mount
-    rm -f "$XRAY_BIN"
+    local src bak rb rc; src=$(_xray_mount_src)
+    if [[ -z "$src" ]]; then echo -e "${Y}Уже используется встроенная версия.${N}"; return; fi
+    if [[ "$src" != "$XRAY_BIN" && ! -f "${src}.orig" ]]; then
+        echo -e "${Y}Ядро подключено не nodectl, а из ${src} (так ноду настроил другой скрипт), и nodectl его не менял.${N}"
+        echo -e "${GR}Перейти на встроенное: уберите строку с ${src} из ${NODE_COMPOSE}, затем cd /opt/remnanode && docker compose up -d${N}"
+        return 0
+    fi
+    bak="${NODE_COMPOSE}.bak.$(date +%s)"; cp "$NODE_COMPOSE" "$bak"
+    rb=$(mktemp)
+    if [[ "$src" == "$XRAY_BIN" ]]; then
+        cp "$NODE_COMPOSE" "$rb"
+        _xray_del_mount >/dev/null || { echo -e "${R}Не удалось изменить docker-compose.yml.${N}"; rm -f "$rb"; return 1; }
+    else
+        _xray_own_on && _xray_del_mount >/dev/null   # лишний том от прошлых версий nodectl
+        cp "$NODE_COMPOSE" "$rb"
+        install -m 0755 "${src}.orig" "$src" || { echo -e "${R}Не удалось записать ${src}.${N}"; rm -f "$rb"; return 1; }
+    fi
     echo -e "${C}Пересоздаю контейнер...${N}"
-    ( cd /opt/remnanode && docker compose up -d --force-recreate ) >/dev/null 2>&1 || true
-    sleep 4
-    echo -e "${G}Возврат к дефолту. Версия Xray: $(_xray_cver).${N}"
-    echo -e "${GR}Теперь после 'nodectl update' будет ядро из нового образа ноды.${N}"
+    _node_recreate; rc=$?
+    if [[ $rc -ne 0 ]]; then _node_restore "$rb" "$rc"; rm -f "$rb"; return 1; fi
+    rm -f "$rb"
+    if [[ "$src" == "$XRAY_BIN" ]]; then
+        rm -f "$XRAY_BIN"
+        echo -e "${G}Возврат к встроенной. Версия Xray: $(_xray_cver_wait).${N}"
+        echo -e "${GR}Теперь после «nodectl update» будет ядро из нового образа ноды.${N}"
+    else
+        rm -f "${src}.orig"
+        echo -e "${G}Вернул ядро, которое стояло до nodectl. Версия Xray: $(_xray_cver_wait).${N}"
+    fi
 }
 
 menu_xray() {
     [[ -f "$NODE_COMPOSE" ]] || { echo -e "${R}Нода не установлена.${N}"; pause; return 1; }
     command -v python3 >/dev/null 2>&1 || { echo -e "${R}Нужен python3.${N}"; pause; return 1; }
-    local mode="stable" versions=() a i v mv arch cver cmode
+    local mode="stable" versions=() a i v mv arch cver cmode src fver cerr
     mapfile -t versions < <(_xray_list "$mode")
     while true; do
         clear
         arch=$(_xray_arch); [[ -n "$arch" ]] || arch="?"
         cver=$(_xray_cver); [[ -n "$cver" ]] || cver="—"
-        if _xray_custom_on; then cmode="${Y}🟢 кастомная (примонтирована)${N}"; else cmode="${G}⚪ встроенная (из образа)${N}"; fi
+        src=$(_xray_mount_src); fver=""
+        if [[ -z "$src" ]]; then cmode="${G}⚪ встроенная (из образа)${N}"
+        elif [[ "$src" == "$XRAY_BIN" ]]; then cmode="${Y}🟢 своя версия (nodectl)${N}"; fver=$(_xray_fver "$src")
+        else cmode="${Y}🟢 своя версия из ${src}${N} ${GR}(подключил другой скрипт)${N}"; fver=$(_xray_fver "$src"); fi
+        cerr=$(cd /opt/remnanode && docker compose config -q 2>&1 | head -1)
         echo -e "${C}══════════════ Xray-core ══════════════${N}"
         echo ""
         echo -e "  ${C}🌐 Текущее состояние${N}"
         echo -e "     Версия Xray:   ${cver}"
         echo -e "     Архитектура:   ${arch}"
         echo -e "     Режим ядра:    ${cmode}"
+        if [[ -n "$fver" && "$cver" != "—" && "$fver" != "$cver" ]]; then
+            echo -e "     ${Y}⚠ В файле ядра ${fver}, а в контейнере ${cver}: контейнер не пересоздан после смены ядра.${N}"
+        fi
+        if [[ -n "$cerr" ]]; then
+            echo -e "     ${R}⚠ Docker не принимает docker-compose.yml — ноду сейчас не пересоздать:${N}"
+            echo -e "       ${GR}${cerr}${N}"
+        fi
         echo ""
         if [[ "$mode" == "stable" ]]; then
             echo -e "  ${C}🎯 Показ релизов:${N} ${G}только стабильные${N}"
@@ -1157,7 +1314,11 @@ menu_xray() {
             echo "     s) только стабильные"
         fi
         echo "     r) обновить список"
-        echo "     d) вернуть встроенную версию (из образа)"
+        if [[ -z "$src" || "$src" == "$XRAY_BIN" ]]; then
+            echo "     d) вернуть встроенную версию (из образа)"
+        elif [[ -f "${src}.orig" ]]; then
+            echo "     d) вернуть прежнее ядро (стояло до nodectl)"
+        fi
         echo "     0) назад"
         echo -e "${C}═══════════════════════════════════════${N}"
         read -rp "$PROMPT" a || return
@@ -1403,31 +1564,72 @@ DOCKER_MARK="$(tok dmark)"
 # --- Логи ноды в файлах: том в docker-compose.yml + logrotate. Идемпотентно; та же логика,
 #     что в nodectl (пункт «l»). Контейнер пересоздаётся только если том действительно добавлен.
 install_node_logs() {
-    local compose="/opt/remnanode/docker-compose.yml" dir="/var/log/remnanode" mark changed=0
+    local compose="/opt/remnanode/docker-compose.yml" dir="/var/log/remnanode" mark bak out changed=0
     mark="$(tok vol)"
     mkdir -p "$dir" && chmod 0755 "$dir"
     if ! grep -q -- "- ${dir}:${dir}" "$compose" 2>/dev/null; then
-        cp "$compose" "${compose}.bak.$(date +%s)"
+        bak="${compose}.bak.$(date +%s)"; cp "$compose" "$bak"
         command -v python3 >/dev/null 2>&1 || apt-get install -y -qq python3 >/dev/null 2>&1 || true
-        python3 - "$compose" "$mark" "${dir}:${dir}" <<'PY' || { warn "Не удалось изменить docker-compose.yml."; return 1; }
+        python3 - "$compose" "$mark" add "${dir}:${dir}" >/dev/null <<'PY' || { warn "Не удалось изменить docker-compose.yml."; return 1; }
 import sys, re
-f, mark, item = sys.argv[1:4]
-b = "    # %s-volbegin" % mark; e = "    # %s-volend" % mark
+f, mark, action, item = sys.argv[1:5]
+tgt = (item.split(':') + [''])[1]
 c = open(f).read()
+if not c.endswith('\n'):
+    c += '\n'
 items = []
-legacy = re.search(r'\n    # (\S+)-xraybegin\n(.*?)\n    # \1-xrayend\n', c, re.DOTALL)
-if legacy:
-    items += [l.strip()[2:].strip() for l in legacy.group(2).splitlines() if l.strip().startswith('- ')]
-    c = c[:legacy.start()] + "\n" + c[legacy.end():]
-m = re.search(r'\n' + re.escape(b) + r'\n(.*?)\n' + re.escape(e) + r'\n', c, re.DOTALL)
-if m:
-    items += [l.strip()[2:].strip() for l in m.group(1).splitlines() if l.strip().startswith('- ')]
-    c = c[:m.start()] + "\n" + c[m.end():]
-items = [i for i in items if i != item] + [item]
-block = "%s\n    volumes:\n%s\n%s\n" % (b, "\n".join("      - " + i for i in items), e)
-mm = re.search(r'^    environment:', c, re.M)
-c = c[:mm.start()] + block + c[mm.start():] if mm else c.rstrip() + "\n" + block
-open(f, 'w').write(c)
+def take(rx):
+    global c, items
+    m = re.search(rx, c, re.DOTALL)
+    if m:
+        items += [l.strip()[2:].strip() for l in m.group(m.lastindex).splitlines() if l.strip().startswith('- ')]
+        c = c[:m.start()] + "\n" + c[m.end():]
+take(r'\n[ \t]*# (\S+)-xraybegin\n(.*?)\n[ \t]*# \1-xrayend\n')
+take(r'\n[ \t]*# ' + re.escape(mark) + r'-volbegin\n(.*?)\n[ \t]*# ' + re.escape(mark) + r'-volend\n')
+own = [i for i in dict.fromkeys(items) if i != item]
+if action == 'add':
+    own.append(item)
+# Чужой список volumes: в сервисе и его пункты.
+vm = re.search(r'^    volumes:[ \t]*(#.*)?$', c, re.M)
+if not vm and re.search(r'^    volumes:', c, re.M) and own:
+    print("volumes в docker-compose.yml записан в одну строку — дописать в него не могу", file=sys.stderr); sys.exit(4)
+foreign, ind = [], None
+if vm:
+    for l in c[vm.end() + 1:].split('\n'):
+        s = l.strip()
+        if not s or s.startswith('#'):
+            continue
+        if re.match(r'^ {4,}- ', l):
+            ind = ind or re.match(r'^ *', l).group(0)
+            foreign.append((re.sub(r'\s+#.*$', '', s[2:]).strip().strip('\'"'), s))
+        elif not re.match(r'^ {5,}\S', l):
+            break
+if action == 'add':
+    if any(v == item for v, s in foreign):
+        own.remove(item)   # уже подключено чужой строкой — дублировать не нужно
+    else:
+        for v, s in foreign:
+            if (v.split(':') + [''])[1] == tgt:
+                print("путь %s в контейнере уже подключён строкой: %s" % (tgt, s), file=sys.stderr); sys.exit(2)
+elif item not in items and any(v == item for v, s in foreign):
+    print("строку %s вписал в docker-compose.yml не nodectl — уберите её вручную" % item, file=sys.stderr); sys.exit(3)
+if own:
+    if vm:
+        ind = ind or "      "
+        block = "%s# %s-volbegin\n%s\n%s# %s-volend\n" % (ind, mark, "\n".join(ind + "- " + i for i in own), ind, mark)
+        p = vm.end() + 1
+        c = c[:p] + block + c[p:]
+    else:
+        block = "    # %s-volbegin\n    volumes:\n%s\n    # %s-volend\n" % (mark, "\n".join("      - " + i for i in own), mark)
+        mm = re.search(r'^    (environment|env_file):', c, re.M)
+        sm = re.search(r'^  remnanode:[^\n]*\n', c, re.M)
+        if mm:
+            c = c[:mm.start()] + block + c[mm.start():]
+        elif sm:
+            c = c[:sm.end()] + block + c[sm.end():]
+        else:
+            c = c.rstrip() + "\n" + block
+open(f, 'w').write(c); print("OK")
 PY
         changed=1
         info "В docker-compose.yml добавлен том ${dir}:${dir}."
@@ -1452,7 +1654,15 @@ ROT
     logrotate -d /etc/logrotate.d/remnanode >/dev/null 2>&1 || { warn "Конфиг logrotate не прошёл проверку."; return 1; }
     if [[ $changed -eq 1 ]] && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
         info "Пересоздаю контейнер ноды, чтобы подхватил том..."
-        ( cd /opt/remnanode && docker compose up -d --force-recreate ) >/dev/null 2>&1 || { warn "Контейнер не пересоздался (cd /opt/remnanode && docker compose logs)."; return 1; }
+        # С ошибкой в файле Docker контейнер не трогает — возвращаем файл, нода работает как была.
+        if ! out=$(cd /opt/remnanode && docker compose config -q 2>&1); then
+            cp "$bak" "$compose"
+            warn "Docker не принял docker-compose.yml, файл возвращён как был: $(printf '%s' "$out" | head -1)"; return 1
+        fi
+        if ! out=$(cd /opt/remnanode && docker compose up -d --force-recreate 2>&1); then
+            cp "$bak" "$compose"; ( cd /opt/remnanode && docker compose up -d --force-recreate ) >/dev/null 2>&1
+            warn "Контейнер не пересоздался, docker-compose.yml возвращён как был: $(printf '%s' "$out" | tail -1)"; return 1
+        fi
     fi
     return 0
 }
